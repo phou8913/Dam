@@ -1,200 +1,394 @@
-# communicator.py (add at very top)
+"""
+LoRa API Communicator with Per-DTU Rate Limiting
+Unified interface for both fake and real LoRa gateway APIs.
+- Per-DTU request queueing to enforce minimum send interval
+- Request-response matching with timeout
+"""
+
 import os
+import time
+import threading
+import queue
+import base64
+import struct
+from typing import Optional, Tuple, Any, Dict, Callable, List
+from collections import defaultdict
 
-if os.getenv("USE_FAKE_DTU") == "1":
-    # Route all communicator calls to the fake implementation
-    from fake_communicator import get_token, send_request, pull_latest_data
+
+# ==================== Determine Backend ====================
+USE_FAKE_DTU = os.getenv("USE_FAKE_DTU") == "1"
+
+if USE_FAKE_DTU:
+    import fake_communicator as _backend
 else:
-    # ---- keep the rest of your original communicator.py below ----
-    """
-    LoRa API Communicator
-    Universal interface for LoRa gateway API communication.
-    Three core functions: authentication, send downlink, and receive uplink.
-    """
+    class _RealBackend:
+        """Real LoRa API communicator"""
+        import requests
 
-    import requests
-    import base64
-    from typing import Optional, Tuple, Any
+        BASE_URL = "http://99.10.226.29:4560/api"
+        ACCOUNT = "admin"
+        PASSWORD = "admin"
 
-
-    # API Configuration - Hardcoded for this deployment
-    BASE_URL = "http://99.10.226.29:4560/api"
-    ACCOUNT = "admin"
-    PASSWORD = "admin"
-
-
-    def get_token() -> str:
-        """
-        Authenticate with the API and retrieve JWT token.
-
-        Returns:
-            str: JWT authentication token
-
-        Raises:
-            RuntimeError: If authentication fails
-            requests.RequestException: If network request fails
-        """
-        url = f"{BASE_URL}/v1/internal/auth"
-        payload = {
-            "account": ACCOUNT,
-            "password": PASSWORD
-        }
-
-        try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-
-            token = response.json().get("token")
-            if not token:
-                raise RuntimeError("Authentication successful but no token received")
-
-            return token
-
-        except requests.RequestException as e:
-            raise RuntimeError(f"Failed to authenticate: {e}")
-
-
-    def send_request(
-        device_id: str,
-        data_to_send: str,
-        auth_token: str,
-        fport: int = 1,
-        reference: str = "downlink-cmd"
-    ) -> Tuple[int, Optional[Any]]:
-        """
-        Send downlink request to a LoRa device.
-
-        Args:
-            device_id: Device EUI identifier
-            data_to_send: Hex-encoded data string (e.g., "010400000003B00B")
-            auth_token: JWT authentication token
-            fport: LoRaWAN fPort (default: 1)
-            reference: Reference identifier for this command (default: "downlink-cmd")
-
-        Returns:
-            tuple: (status, api_response)
-                - status: 1 if successful, 0 if failed
-                - api_response: API response dict if successful, None if failed
-        """
-        try:
-            url = f"{BASE_URL}/v1/devices/{device_id}/queue"
-            headers = {
-                "token": auth_token,
-                "content-type": "application/json"
-            }
+        @staticmethod
+        def get_token() -> str:
+            """Authenticate with the API and retrieve JWT token."""
+            url = f"{_RealBackend.BASE_URL}/v1/internal/auth"
             payload = {
-                "confirmed": False,
-                "mode": "hex",
-                "data": data_to_send,
-                "fPort": fport,
-                "reference": reference
+                "account": _RealBackend.ACCOUNT,
+                "password": _RealBackend.PASSWORD
             }
+            try:
+                response = _RealBackend.requests.post(url, json=payload)
+                response.raise_for_status()
+                token = response.json().get("token")
+                if not token:
+                    raise RuntimeError("Authentication successful but no token received")
+                return token
+            except Exception as e:
+                raise RuntimeError(f"Failed to authenticate: {e}")
 
-            response = requests.post(url, json=payload, headers=headers)
-            response.raise_for_status()
+        @staticmethod
+        def send_request(
+            device_id: str,
+            data_to_send: str,
+            auth_token: str,
+            fport: int = 1,
+            reference: str = "downlink-cmd"
+        ) -> Tuple[int, Optional[Any]]:
+            """Send downlink request to a LoRa device."""
+            try:
+                url = f"{_RealBackend.BASE_URL}/v1/devices/{device_id}/queue"
+                headers = {
+                    "token": auth_token,
+                    "content-type": "application/json"
+                }
+                payload = {
+                    "confirmed": False,
+                    "mode": "hex",
+                    "data": data_to_send,
+                    "fPort": fport,
+                    "reference": reference
+                }
+                response = _RealBackend.requests.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                return (1, response.json())
+            except Exception as e:
+                print(f"Error sending request: {e}")
+                return (0, None)
 
-            return (1, response.json())
+        @staticmethod
+        def pull_latest_uplinks(
+            device_id: str,
+            auth_token: str,
+            size: int = 10
+        ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+            """
+            Pull latest uplinks with timestamp and metadata.
+            Returns list of dicts: {ts, fport, hex, ...}
+            """
+            try:
+                url = f"{_RealBackend.BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
+                headers = {"token": auth_token}
+                params = {"size": size, "page": 1}
+                response = _RealBackend.requests.get(url, headers=headers, params=params)
+                response.raise_for_status()
 
-        except Exception as e:
-            print(f"Error sending request: {e}")
-            return (0, None)
+                uplinks_raw = response.json().get("result", [])
+                uplinks = []
+
+                for u in uplinks_raw:
+                    raw_b64 = u.get("data")
+                    fport = u.get("fPort", 0)
+                    # Try to extract timestamp from API response
+                    ts = u.get("rxTime") or u.get("time") or time.time()
+                    if isinstance(ts, str):
+                        try:
+                            # Parse ISO8601 or similar
+                            ts = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+                        except:
+                            ts = time.time()
+
+                    if raw_b64 and fport > 0:
+                        try:
+                            raw_bytes = base64.b64decode(raw_b64)
+                            hex_data = raw_bytes.hex()
+                            uplinks.append({
+                                "ts": ts,
+                                "fport": fport,
+                                "hex": hex_data,
+                                "raw": u
+                            })
+                        except Exception as e:
+                            print(f"Warning: Failed to decode uplink: {e}")
+
+                if uplinks:
+                    return (1, uplinks)
+                return (0, None)
+
+            except Exception as e:
+                print(f"Error pulling uplinks: {e}")
+                return (0, None)
+
+    _backend = _RealBackend()
 
 
-    def pull_latest_data(
-        device_id: str,
-        auth_token: str,
-        size: int = 10
-    ) -> Tuple[int, Optional[str]]:
+# ==================== Per-DTU Rate Limiter ====================
+class DTUQueue:
+    """
+    Per-DTU message queue with rate limiting.
+    Ensures minimum interval between consecutive sends to same DTU.
+    """
+
+    def __init__(self, dev_eui: str, min_interval_sec: float = 1.0):
+        self.dev_eui = dev_eui
+        self.min_interval_sec = min_interval_sec
+        self._queue = queue.Queue()
+        self._last_send_time = 0.0
+        self._lock = threading.Lock()
+        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self._worker_thread.start()
+
+    def _worker(self):
+        """Worker thread: process queue with rate limiting."""
+        while True:
+            try:
+                task = self._queue.get(timeout=0.1)
+                if task is None:  # shutdown signal
+                    break
+
+                send_func, send_args, send_kwargs, result_holder = task
+
+                # Enforce minimum interval
+                with self._lock:
+                    elapsed = time.time() - self._last_send_time
+                    if elapsed < self.min_interval_sec:
+                        time.sleep(self.min_interval_sec - elapsed)
+                    self._last_send_time = time.time()
+
+                # Execute send
+                try:
+                    result = send_func(*send_args, **send_kwargs)
+                    result_holder["result"] = result
+                    result_holder["error"] = None
+                except Exception as e:
+                    result_holder["result"] = None
+                    result_holder["error"] = str(e)
+
+            except queue.Empty:
+                continue
+
+    def send(self, send_func: Callable, *args, **kwargs) -> Tuple[int, Optional[Any]]:
         """
-        Pull latest uplink data from a LoRa device.
-        Searches recent uplinks for valid application data.
-
-        Args:
-            device_id: Device EUI identifier
-            auth_token: JWT authentication token
-            size: Number of recent uplinks to check (default: 10)
+        Queue a send operation and wait for result.
 
         Returns:
-            tuple: (status, hex_data)
-                - status: 1 if valid data found, 0 if no valid data
-                - hex_data: Hex string of payload if found, None if not found
+            tuple: (status, response) from send_func
         """
-        try:
-            url = f"{BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
-            headers = {"token": auth_token}
-            params = {"size": size, "page": 1}
+        result_holder = {"result": None, "error": None}
+        self._queue.put((send_func, args, kwargs, result_holder))
 
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
+        # Wait for result (with timeout to avoid blocking forever)
+        timeout = 10
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if result_holder["result"] is not None or result_holder["error"] is not None:
+                if result_holder["error"]:
+                    return (0, None)
+                return result_holder["result"]
+            time.sleep(0.01)
 
-            uplinks = response.json().get("result", [])
+        return (0, None)
 
-            # Find first uplink with valid application data (fPort > 0 and data present)
-            for uplink in uplinks:
-                raw_b64 = uplink.get("data")
-                fport = uplink.get("fPort", 0)
 
-                if raw_b64 and fport > 0:
-                    try:
-                        raw_bytes = base64.b64decode(raw_b64)
-                        hex_data = raw_bytes.hex()
-                        return (1, hex_data)
-                    except Exception as e:
-                        print(f"Warning: Failed to decode uplink payload: {e}")
+# Global DTU queues
+_DTU_QUEUES: Dict[str, DTUQueue] = {}
+_QUEUE_LOCK = threading.Lock()
+
+
+def _get_dtu_queue(dev_eui: str, min_interval_sec: float = 1.0) -> DTUQueue:
+    """Get or create DTU queue."""
+    with _QUEUE_LOCK:
+        if dev_eui not in _DTU_QUEUES:
+            _DTU_QUEUES[dev_eui] = DTUQueue(dev_eui, min_interval_sec)
+        return _DTU_QUEUES[dev_eui]
+
+
+# ==================== Public API ====================
+
+def get_token() -> str:
+    """Get authentication token (route to backend)."""
+    return _backend.get_token()
+
+
+def send_request(
+    device_id: str,
+    data_to_send: str,
+    auth_token: str,
+    fport: int = 1,
+    reference: str = "downlink-cmd",
+    min_interval_sec: float = 1.0
+) -> Tuple[int, Optional[Any]]:
+    """
+    Send downlink with per-DTU rate limiting.
+
+    Args:
+        device_id: Device EUI
+        data_to_send: Hex string to send
+        auth_token: Authentication token
+        fport: LoRaWAN fPort
+        reference: Reference identifier
+        min_interval_sec: Minimum interval (seconds) between sends to this DTU
+
+    Returns:
+        tuple: (status, response)
+    """
+    queue = _get_dtu_queue(device_id, min_interval_sec)
+
+    def _do_send():
+        return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
+
+    return queue.send(_do_send)
+
+
+def pull_latest_data(
+    device_id: str,
+    auth_token: str,
+    size: int = 10
+) -> Tuple[int, Optional[str]]:
+    """
+    Pull latest uplink data (for mmWave sensor compatibility).
+
+    Args:
+        device_id: Device EUI
+        auth_token: Authentication token
+        size: Number of uplinks to retrieve
+
+    Returns:
+        tuple: (status, hex_string) - returns the most recent uplink hex data
+    """
+    status, uplinks = pull_latest_uplinks(device_id, auth_token, size)
+    if status != 1 or not uplinks:
+        return (0, None)
+    # Return the most recent uplink's hex data
+    return (1, uplinks[0]["hex"])
+
+
+def pull_latest_uplinks(
+    device_id: str,
+    auth_token: str,
+    size: int = 10
+) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+    """
+    Pull latest uplinks with timestamp info.
+
+    Returns:
+        tuple: (status, list of {ts, fport, hex, raw})
+    """
+    if USE_FAKE_DTU:
+        status, hex_data = _backend.pull_latest_data(device_id, auth_token, size)
+        if status != 1 or hex_data is None:
+            return (0, None)
+        # Wrap fake data with timestamp
+        return (1, [{
+            "ts": time.time(),
+            "fport": 1,
+            "hex": hex_data,
+            "raw": {}
+        }])
+    else:
+        return _backend.pull_latest_uplinks(device_id, auth_token, size)
+
+
+def send_and_wait(
+    device_id: str,
+    data_to_send: str,
+    auth_token: str,
+    response_validator: Callable[[str], bool],
+    timeout_sec: float = 30.0,
+    fport: int = 1,
+    reference: str = "downlink-cmd",
+    min_interval_sec: float = 1.0,
+    poll_interval_sec: float = 1.0,
+    response_matcher: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    echo_tag_hex: Optional[str] = None,
+) -> Tuple[int, Optional[str]]:
+    """
+    Send request and wait for matching response.
+
+    Args:
+        device_id: Device EUI
+        data_to_send: Hex string to send
+        auth_token: Auth token
+        response_validator: Callable that returns True if uplink is the response for this request
+        response_matcher: Optional callable that receives full uplink dict (ts/fport/hex/raw)
+            and returns True only when this uplink matches the request (e.g., echo sequence number/random nonce)
+        echo_tag_hex: Optional hex string that must appear in the uplink hex. If provided,
+            uplinks that do not contain this tag are skipped. Use this when you put
+            unique identifiers in downlink and require echoing in uplink.
+        timeout_sec: Timeout in seconds
+        fport: LoRaWAN fPort for downlink
+        reference: Reference identifier
+        min_interval_sec: Minimum interval between sends to this DTU
+        poll_interval_sec: Interval between uplink polls
+
+    Returns:
+        tuple: (status, hex_response_string) or (0, None) on timeout/failure
+    """
+    # Send the request
+    send_time = time.time()
+    status, response = send_request(
+        device_id, data_to_send, auth_token, fport, reference, min_interval_sec
+    )
+
+    if echo_tag_hex:
+        print(f"[send_and_wait] request tag={echo_tag_hex} device={device_id}")
+
+    if status != 1:
+        print(f"[send_and_wait] Failed to send request to {device_id}")
+        return (0, None)
+
+    # Poll for response
+    deadline = send_time + timeout_sec
+    while time.time() < deadline:
+        time.sleep(poll_interval_sec)
+
+        status, uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
+        if status != 1 or uplinks is None:
+            continue
+
+        # Filter uplinks: only after send_time, optional tag/matcher, then pass validator
+        for uplink in uplinks:
+            if uplink["ts"] < send_time:
+                continue  # Too old
+
+            hex_data = uplink["hex"]
+
+            # If caller provided an echo tag, enforce it must appear in uplink
+            if echo_tag_hex:
+                if echo_tag_hex.lower() not in hex_data.lower():
+                    # Tag missing, skip but log once per candidate
+                    print(f"[send_and_wait] skip uplink: tag missing tag={echo_tag_hex} device={device_id} ts={uplink['ts']} hex={hex_data}")
+                    continue
+                else:
+                    print(f"[send_and_wait] candidate tag match tag={echo_tag_hex} device={device_id}")
+
+            # Optional extra match (e.g., sequence/nonce echoed back)
+            if response_matcher is not None:
+                try:
+                    if not response_matcher(uplink):
                         continue
+                except Exception as e:
+                    print(f"[send_and_wait] Matcher error: {e}")
+                    continue
+            try:
+                if response_validator(hex_data):
+                    print(f"[send_and_wait] accepted uplink tag={echo_tag_hex if echo_tag_hex else 'None'} device={device_id} ts={uplink['ts']} hex={hex_data}")
+                    return (1, hex_data)
+            except Exception as e:
+                print(f"[send_and_wait] Validator error: {e}")
+                continue
 
-            # No valid data found
-            return (0, None)
-
-        except Exception as e:
-            print(f"Error pulling data: {e}")
-            return (0, None)
-
-
-    # ============ Example Usage ============
-
-    if __name__ == "__main__":
-        print("=== LoRa API Communicator Example ===\n")
-
-        # Example device EUI (replace with your actual device)
-        DEV_EUI = "8695311000931640"
-
-        try:
-            # Step 1: Get authentication token
-            print("1. Authenticating...")
-            token = get_token()
-            print(f"   Token obtained: {token[:20]}...\n")
-
-            # Step 2: Send downlink command
-            print("2. Sending downlink command...")
-            status, response = send_request(
-                device_id=DEV_EUI,
-                data_to_send="010400000003B00B",
-                auth_token=token
-            )
-
-            if status == 1:
-                print(f"   Success! Response: {response}")
-            else:
-                print(f"   Failed to send command")
-            print()
-
-            # Step 3: Pull latest uplink data
-            print("3. Pulling latest uplink data...")
-            status, raw_data = pull_latest_data(
-                device_id=DEV_EUI,
-                auth_token=token,
-                size=10
-            )
-
-            if status == 1 and raw_data:
-                print(f"   Data found!")
-                print(f"   Hex: {raw_data}")
-                print(f"   Length: {len(raw_data)} bytes")
-            else:
-                print(f"   No valid data found")
-
-        except Exception as e:
-            print(f"Error: {e}")
+    print(f"[send_and_wait] Timeout waiting for response from {device_id}")
+    return (0, None)
 
 

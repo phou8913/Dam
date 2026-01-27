@@ -32,10 +32,11 @@ def _append_crc_le(frame_wo_crc: bytes) -> bytes:
 class FakeDTU:
     """
     Each DTU maintains its own uplink queue (newest first).
+    Each uplink now carries: {ts, hex, fport}
     """
     def __init__(self, dev_eui: str):
         self.dev_eui = dev_eui
-        self._uplinks: List[str] = []  # hex strings, newest first
+        self._uplinks: List[Dict[str, Any]] = []  # dicts with ts, hex, fport
         self._last_downlink: Optional[Dict[str, Any]] = None
 
     def on_downlink(self, data_to_send_hex: str, fport: int, reference: str) -> None:
@@ -53,17 +54,30 @@ class FakeDTU:
         """
         return
 
-    def push_uplink_hex(self, payload_hex: str) -> None:
-        # newest at front
-        self._uplinks.insert(0, payload_hex)
+    def push_uplink_hex(self, payload_hex: str, fport: int = 1) -> None:
+        """Push uplink with timestamp."""
+        uplink = {
+            "ts": time.time(),
+            "hex": payload_hex,
+            "fport": fport
+        }
+        self._uplinks.insert(0, uplink)  # newest at front
         # keep recent history
         self._uplinks = self._uplinks[:50]
 
     def pull_latest(self, size: int = 10) -> Optional[str]:
+        """Pull latest uplink hex (backward compat)."""
         self.generate_uplink_if_needed()
         if not self._uplinks:
             return None
-        return self._uplinks[0]
+        return self._uplinks[0]["hex"]
+
+    def pull_latest_uplinks(self, size: int = 10) -> Optional[List[Dict[str, Any]]]:
+        """Pull latest uplinks with full metadata."""
+        self.generate_uplink_if_needed()
+        if not self._uplinks:
+            return None
+        return self._uplinks[:size]
 
 
 # -----------------------------
@@ -86,7 +100,7 @@ class FakeHumidityTempDTU(FakeDTU):
 
         payload = struct.pack(">BBBhHh", 0x01, 0x04, 0x06, t_raw, h_raw, d_raw)
         frame = _append_crc_le(payload)
-        self.push_uplink_hex(frame.hex())
+        self.push_uplink_hex(frame.hex(), fport=1)
 
 
 # -----------------------------
@@ -99,8 +113,8 @@ class FakeHumidityTempDTU(FakeDTU):
 class FakeTiltAccDTU(FakeDTU):
     READ_ANGLES_CMD = "5003003D00039986"
     READ_ACCEL_CMD = "5003003400034984"
-    READ_GPS_CMD = "500300490004985E" # new
-    RESET_CMD    = "5006000000FFC40B" # new
+    READ_GPS_CMD = "500300490004985E"
+    RESET_CMD    = "5006000000FFC40B"
 
     def on_downlink(self, data_to_send_hex: str, fport: int, reference: str) -> None:
         super().on_downlink(data_to_send_hex, fport, reference)
@@ -121,7 +135,7 @@ class FakeTiltAccDTU(FakeDTU):
 
             data6 = struct.pack(">hhh", to_raw(roll), to_raw(pitch), to_raw(yaw))
             frame = header + data6 + b"\x00\x00"
-            self.push_uplink_hex(frame.hex())
+            self.push_uplink_hex(frame.hex(), fport=1)
             return
 
         if data_to_send_hex.upper() == self.READ_ACCEL_CMD:
@@ -130,18 +144,17 @@ class FakeTiltAccDTU(FakeDTU):
             ay = random.uniform(-0.5, 0.5)
             az = random.uniform(-0.5, 0.5)
 
-            # inverse of your decode: g = raw/32768*16 => raw = g/16*32768
+            # inverse of your decode: g = raw/16*32768 => raw = g/16*32768
             def to_raw(g: float) -> int:
                 return int(g / 16.0 * 32768)
 
             data6 = struct.pack(">hhh", to_raw(ax), to_raw(ay), to_raw(az))
             frame = header + data6 + b"\x00\x00"
-            self.push_uplink_hex(frame.hex())
+            self.push_uplink_hex(frame.hex(), fport=1)
             return
         
         # New GPS command handling
         if data_to_send_hex.replace(" ", "").upper() == self.READ_GPS_CMD:
-            # Placeholder GPS response: ensure len>=11 and bytes[3:9] carry 3 int16
             lat = random.uniform(33.0, 35.0)
             lon = random.uniform(-85.0, -83.0)
             spd = random.uniform(0.0, 30.0)
@@ -152,16 +165,15 @@ class FakeTiltAccDTU(FakeDTU):
 
             data6 = struct.pack(">hhh", lat_raw, lon_raw, spd_raw)
             frame = header + data6 + b"\x00\x00"
-            self.push_uplink_hex(frame.hex())
+            self.push_uplink_hex(frame.hex(), fport=1)
             return
         
         # New Reset command handling
         if data_to_send_hex.replace(" ", "").upper() == self.RESET_CMD:
-            # Reset: clear history and ACK
             self._uplinks.clear()
             data6 = b"\x00\x00\x00\x00\x00\x01"
             frame = bytes([0x50, 0x06, 0x02]) + data6 + b"\x00\x00"
-            self.push_uplink_hex(frame.hex())
+            self.push_uplink_hex(frame.hex(), fport=1)
             return
 
         # Unknown downlink: do nothing
@@ -184,7 +196,7 @@ class FakeWaterLevelDTU(FakeDTU):
         data4 = struct.pack(">f", float(level_m))
         frame_wo_crc = header + data4
         frame = _append_crc_le(frame_wo_crc)
-        self.push_uplink_hex(frame.hex())
+        self.push_uplink_hex(frame.hex(), fport=1)
 
 
 # -----------------------------
@@ -223,7 +235,7 @@ class FakeMMWaveDTU(FakeDTU):
             # pack big-endian: dist u16, angle s16
             payload += struct.pack(">Hh", distance_raw, angle_raw)
 
-        self.push_uplink_hex(payload.hex())
+        self.push_uplink_hex(payload.hex(), fport=1)
 
 
 # -----------------------------
@@ -323,8 +335,22 @@ def pull_latest_data(
     auth_token: str,
     size: int = 10
 ) -> Tuple[int, Optional[str]]:
+    """Legacy: pull single hex string (backward compat)."""
     dtu = _GATEWAY.get_or_create(device_id)
     hex_payload = dtu.pull_latest(size=size)
     if hex_payload:
         return 1, hex_payload
+    return 0, None
+
+
+def pull_latest_uplinks(
+    device_id: str,
+    auth_token: str,
+    size: int = 10
+) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+    """Pull latest uplinks with metadata (ts, hex, fport)."""
+    dtu = _GATEWAY.get_or_create(device_id)
+    uplinks = dtu.pull_latest_uplinks(size=size)
+    if uplinks:
+        return 1, uplinks
     return 0, None

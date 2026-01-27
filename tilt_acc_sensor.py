@@ -20,16 +20,18 @@ class HWT901BSensor:
     READ_ANGLES_CMD = "5003003D00039986"
     READ_ACCEL_CMD = "5003003400034984"
 
-    def __init__(self, dev_eui: str, token=None):
+    def __init__(self, dev_eui: str, token=None, min_send_interval_sec: float = 1.0):
         """
         Initialize the sensor with device EUI.
 
         Args:
             dev_eui: Device EUI identifier for the LoRa sensor
             token: Optional JWT token
+            min_send_interval_sec: Minimum interval (seconds) between sends to this DTU
         """
         self.dev_eui = dev_eui
         self._token = token
+        self.min_send_interval_sec = min_send_interval_sec
 
     def _ensure_token(self):
         """Ensure we have a valid authentication token."""
@@ -41,6 +43,48 @@ class HWT901BSensor:
     def _int16_be(b: bytes) -> int:
         """Convert 2 bytes (Big Endian) to signed 16-bit integer."""
         return struct.unpack(">h", b)[0]
+
+    def _validate_angles_response(self, hex_data: str) -> bool:
+        """
+        Strong validator for angles response.
+        Expected: [0x50][0x03][0x06] + 6 data bytes + 2 pad bytes (11+ bytes total)
+        """
+        try:
+            data = bytes.fromhex(hex_data)
+            
+            if len(data) < 11:
+                return False
+            
+            # Check frame header
+            if data[0] != 0x50 or data[1] != 0x03 or data[2] != 0x06:
+                return False
+            
+            # Valid: frame header matches expected angles response
+            return True
+        except Exception as e:
+            print(f"[HWT901BSensor] Angles validator error: {e}")
+            return False
+
+    def _validate_accel_response(self, hex_data: str) -> bool:
+        """
+        Strong validator for acceleration response.
+        Expected: [0x50][0x03][0x06] + 6 data bytes + 2 pad bytes (11+ bytes total)
+        """
+        try:
+            data = bytes.fromhex(hex_data)
+            
+            if len(data) < 11:
+                return False
+            
+            # Check frame header (same as angles)
+            if data[0] != 0x50 or data[1] != 0x03 or data[2] != 0x06:
+                return False
+            
+            # Valid: frame header matches expected accel response
+            return True
+        except Exception as e:
+            print(f"[HWT901BSensor] Accel validator error: {e}")
+            return False
 
     def parse_angles(self, data) -> Optional[Dict[str, Any]]:
         """
@@ -129,17 +173,19 @@ class HWT901BSensor:
 
     def read_angles(
             self,
-            max_attempts: int = 12,
-            poll_interval: int = 5,
-            auto_unlock: bool = True
+            timeout_sec: float = 30.0,
+            poll_interval_sec: float = 1.0,
+            auto_unlock: bool = True,
+            echo_tag_hex: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Read angle data from the device.
+        Read angle data from the device using send_and_wait.
 
         Args:
-            max_attempts: Maximum number of polling attempts
-            poll_interval: Seconds to wait between polling attempts
+            timeout_sec: Timeout in seconds
+            poll_interval_sec: Polling interval in seconds
             auto_unlock: Automatically send unlock command before reading
+            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed angle data or None if reading fails
@@ -148,41 +194,38 @@ class HWT901BSensor:
             token = self._ensure_token()
 
             if auto_unlock:
+                # Send unlock first (no response waiting)
                 status, _ = communicator.send_request(
                     device_id=self.dev_eui,
                     data_to_send=self.UNLOCK_CMD,
-                    auth_token=token
+                    auth_token=token,
+                    min_interval_sec=self.min_send_interval_sec
                 )
                 if status != 1:
                     print(f"Failed to send unlock command")
                     return None
                 time.sleep(0.5)
 
-            status, _ = communicator.send_request(
+            # Use send_and_wait with strong response validator
+            status, hex_data = communicator.send_and_wait(
                 device_id=self.dev_eui,
                 data_to_send=self.READ_ANGLES_CMD,
-                auth_token=token
+                auth_token=token,
+                response_validator=self._validate_angles_response,
+                timeout_sec=timeout_sec,
+                fport=1,
+                reference="angles-read",
+                min_interval_sec=self.min_send_interval_sec,
+                poll_interval_sec=poll_interval_sec,
+                echo_tag_hex=echo_tag_hex,
             )
 
-            if status != 1:
-                print(f"Failed to send read angles command")
+            if status != 1 or hex_data is None:
+                print(f"Failed to read angles from device {self.dev_eui}")
                 return None
 
-            for attempt in range(1, max_attempts + 1):
-                time.sleep(poll_interval)
-
-                status, hex_data = communicator.pull_latest_data(
-                    device_id=self.dev_eui,
-                    auth_token=token,
-                    size=10
-                )
-
-                if status == 1 and hex_data:
-                    parsed_data = self.parse_angles(hex_data)
-                    return parsed_data
-
-            print(f"No response received after {max_attempts} attempts")
-            return None
+            parsed_data = self.parse_angles(hex_data)
+            return parsed_data
 
         except Exception as e:
             print(f"Error reading angles: {e}")
@@ -190,17 +233,19 @@ class HWT901BSensor:
 
     def read_acceleration(
             self,
-            max_attempts: int = 12,
-            poll_interval: int = 5,
-            auto_unlock: bool = True
+            timeout_sec: float = 30.0,
+            poll_interval_sec: float = 1.0,
+            auto_unlock: bool = True,
+            echo_tag_hex: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Read acceleration data from the device.
+        Read acceleration data from the device using send_and_wait.
 
         Args:
-            max_attempts: Maximum number of polling attempts
-            poll_interval: Seconds to wait between polling attempts
+            timeout_sec: Timeout in seconds
+            poll_interval_sec: Polling interval in seconds
             auto_unlock: Automatically send unlock command before reading
+            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed acceleration data or None if reading fails
@@ -209,41 +254,38 @@ class HWT901BSensor:
             token = self._ensure_token()
 
             if auto_unlock:
+                # Send unlock first (no response waiting)
                 status, _ = communicator.send_request(
                     device_id=self.dev_eui,
                     data_to_send=self.UNLOCK_CMD,
-                    auth_token=token
+                    auth_token=token,
+                    min_interval_sec=self.min_send_interval_sec
                 )
                 if status != 1:
                     print(f"Failed to send unlock command")
                     return None
                 time.sleep(0.5)
 
-            status, _ = communicator.send_request(
+            # Use send_and_wait with strong response validator
+            status, hex_data = communicator.send_and_wait(
                 device_id=self.dev_eui,
                 data_to_send=self.READ_ACCEL_CMD,
-                auth_token=token
+                auth_token=token,
+                response_validator=self._validate_accel_response,
+                timeout_sec=timeout_sec,
+                fport=1,
+                reference="accel-read",
+                min_interval_sec=self.min_send_interval_sec,
+                poll_interval_sec=poll_interval_sec,
+                echo_tag_hex=echo_tag_hex,
             )
 
-            if status != 1:
-                print(f"Failed to send read acceleration command")
+            if status != 1 or hex_data is None:
+                print(f"Failed to read acceleration from device {self.dev_eui}")
                 return None
 
-            for attempt in range(1, max_attempts + 1):
-                time.sleep(poll_interval)
-
-                status, hex_data = communicator.pull_latest_data(
-                    device_id=self.dev_eui,
-                    auth_token=token,
-                    size=10
-                )
-
-                if status == 1 and hex_data:
-                    parsed_data = self.parse_acceleration(hex_data)
-                    return parsed_data
-
-            print(f"No response received after {max_attempts} attempts")
-            return None
+            parsed_data = self.parse_acceleration(hex_data)
+            return parsed_data
 
         except Exception as e:
             print(f"Error reading acceleration: {e}")

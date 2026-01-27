@@ -404,8 +404,8 @@ class SensorDashboard:
         dev_eui = self.ht_eui_entry.get().strip()
         self.log_terminal("\n--- Humidity/Temperature Sensor ---")
         try:
-            sensor = HumidityTempSensor(dev_eui=dev_eui)
-            data = sensor.read_data(max_attempts=1, poll_interval=self.poll_interval)
+            sensor = HumidityTempSensor(dev_eui=dev_eui, min_send_interval_sec=1.0)
+            data = sensor.read_data(timeout_sec=15.0, poll_interval_sec=1.0)
 
             if data:
                 self.log_terminal(f"Temperature: {data['temperature_c']:.2f} °C")
@@ -424,17 +424,17 @@ class SensorDashboard:
         dev_eui = self.ta_eui_entry.get().strip()
         self.log_terminal("\n--- Tilt/Acceleration Sensor ---")
         try:
-            sensor = HWT901BSensor(dev_eui=dev_eui)
+            sensor = HWT901BSensor(dev_eui=dev_eui, min_send_interval_sec=1.0)
 
             # Read angles
-            angles = sensor.read_angles(max_attempts=1, poll_interval=self.poll_interval)
+            angles = sensor.read_angles(timeout_sec=15.0, poll_interval_sec=1.0)
             if angles:
                 self.log_terminal(f"Roll: {angles['roll']:.2f}°")
                 self.log_terminal(f"Pitch: {angles['pitch']:.2f}°")
                 self.log_terminal(f"Yaw: {angles['yaw']:.2f}°")
 
                 # Read acceleration
-                accel = sensor.read_acceleration(max_attempts=1, poll_interval=self.poll_interval, auto_unlock=False)
+                accel = sensor.read_acceleration(timeout_sec=15.0, poll_interval_sec=1.0, auto_unlock=False)
                 if accel:
                     self.log_terminal(f"Ax: {accel['ax_g']:.3f}g ({accel['ax_ms2']:.2f} m/s²)")
                     self.log_terminal(f"Ay: {accel['ay_g']:.3f}g ({accel['ay_ms2']:.2f} m/s²)")
@@ -454,8 +454,8 @@ class SensorDashboard:
         dev_eui = self.wl_eui_entry.get().strip()
         self.log_terminal("\n--- Water Level Sensor ---")
         try:
-            sensor = WaterLevelSensor(dev_eui=dev_eui)
-            data = sensor.read_data(max_attempts=1, poll_interval=self.poll_interval)
+            sensor = WaterLevelSensor(dev_eui=dev_eui, min_send_interval_sec=1.0)
+            data = sensor.read_data(timeout_sec=15.0, poll_interval_sec=1.0)
 
             if data:
                 self.log_terminal(f"Water Level: {data['level_m']:.3f} m")

@@ -20,15 +20,18 @@ class HumidityTempSensor:
     # Modbus command to read 3 registers: T, H, D
     MODBUS_READ_CMD = "010400000003B00B"
 
-    def __init__(self, dev_eui: str, token=None):
+    def __init__(self, dev_eui: str, token=None, min_send_interval_sec: float = 1.0):
         """
         Initialize the sensor with device EUI.
 
         Args:
             dev_eui: Device EUI identifier for the LoRa sensor
+            token: Optional JWT token
+            min_send_interval_sec: Minimum interval (seconds) between sends to this DTU
         """
         self.dev_eui = dev_eui
         self._token = token
+        self.min_send_interval_sec = min_send_interval_sec
 
     def _ensure_token(self):
         """Ensure we have a valid authentication token."""
@@ -82,6 +85,39 @@ class HumidityTempSensor:
             int: Unsigned 16-bit integer
         """
         return struct.unpack(">H", b)[0]
+
+    def _validate_response(self, hex_data: str) -> bool:
+        """
+        Strong validator: check Modbus frame integrity.
+        Expected: [01][04][06][T_Hi][T_Lo][H_Hi][H_Lo][D_Hi][D_Lo][CRC_Lo][CRC_Hi]
+        """
+        try:
+            data = bytes.fromhex(hex_data)
+            
+            # Minimum frame length
+            if len(data) < 11:
+                return False
+            
+            # Check function code (0x04 = Read Input Registers)
+            if data[1] != 0x04:
+                return False
+            
+            # Check byte count (should be 0x06 for 3 registers)
+            if data[2] != 0x06:
+                return False
+            
+            # Validate CRC
+            frame_len = len(data)
+            data_end = frame_len - 2
+            frame_without_crc = data[:data_end]
+            received_crc_bytes = data[data_end:]
+            received_crc = (received_crc_bytes[1] << 8) | received_crc_bytes[0]
+            calculated_crc = self._crc16_modbus(frame_without_crc)
+            
+            return calculated_crc == received_crc
+        except Exception as e:
+            print(f"[HumidityTempSensor] Validator error: {e}")
+            return False
 
     def parse_humidity_sensor_data(self, data) -> Optional[Dict[str, Any]]:
         """
@@ -163,17 +199,17 @@ class HumidityTempSensor:
 
     def read_data(
         self,
-        max_attempts: int = 12,
-        poll_interval: int = 5,
-        auto_send_command: bool = True
+        timeout_sec: float = 30.0,
+        poll_interval_sec: float = 1.0,
+        echo_tag_hex: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Read live sensor data from the device.
+        Read live sensor data using send_and_wait (request-response matching).
 
         Args:
-            max_attempts: Maximum number of polling attempts (default: 12)
-            poll_interval: Seconds to wait between polling attempts (default: 5)
-            auto_send_command: Automatically send read command before polling (default: True)
+            timeout_sec: Timeout in seconds
+            poll_interval_sec: Polling interval in seconds
+            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed sensor data or None if reading fails
@@ -181,32 +217,26 @@ class HumidityTempSensor:
         try:
             token = self._ensure_token()
 
-            if auto_send_command:
-                status, response = communicator.send_request(
-                    device_id=self.dev_eui,
-                    data_to_send=self.MODBUS_READ_CMD,
-                    auth_token=token
-                )
+            # Use send_and_wait with strong response validator
+            status, hex_data = communicator.send_and_wait(
+                device_id=self.dev_eui,
+                data_to_send=self.MODBUS_READ_CMD,
+                auth_token=token,
+                response_validator=self._validate_response,
+                timeout_sec=timeout_sec,
+                fport=1,
+                reference="humidity-read",
+                min_interval_sec=self.min_send_interval_sec,
+                poll_interval_sec=poll_interval_sec,
+                echo_tag_hex=echo_tag_hex,
+            )
 
-                if status != 1:
-                    print(f"Failed to send read command to device {self.dev_eui}")
-                    return None
+            if status != 1 or hex_data is None:
+                print(f"Failed to read from device {self.dev_eui}")
+                return None
 
-            for attempt in range(1, max_attempts + 1):
-                time.sleep(poll_interval)
-
-                status, hex_data = communicator.pull_latest_data(
-                    device_id=self.dev_eui,
-                    auth_token=token,
-                    size=10
-                )
-
-                if status == 1 and hex_data:
-                    parsed_data = self.parse_humidity_sensor_data(hex_data)
-                    return parsed_data
-
-            print(f"No response received from device {self.dev_eui} after {max_attempts} attempts")
-            return None
+            parsed_data = self.parse_humidity_sensor_data(hex_data)
+            return parsed_data
 
         except Exception as e:
             print(f"Error reading sensor data: {e}")

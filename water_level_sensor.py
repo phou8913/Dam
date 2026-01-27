@@ -19,16 +19,18 @@ class WaterLevelSensor:
 
     SLAVE_ADDR = 123
 
-    def __init__(self, dev_eui: str, token=None):
+    def __init__(self, dev_eui: str, token=None, min_send_interval_sec: float = 1.0):
         """
         Initialize the sensor with device EUI.
 
         Args:
             dev_eui: Device EUI identifier for the LoRa sensor
             token: Optional JWT token
+            min_send_interval_sec: Minimum interval (seconds) between sends to this DTU
         """
         self.dev_eui = dev_eui
         self._token = token
+        self.min_send_interval_sec = min_send_interval_sec
         self._read_cmd = self._make_read_command()
 
     def _ensure_token(self):
@@ -60,6 +62,43 @@ class WaterLevelSensor:
         crc_bytes = struct.pack('<H', crc)
         full_frame = frame + crc_bytes
         return full_frame.hex()
+
+    def _validate_response(self, hex_data: str) -> bool:
+        """
+        Strong validator: check Modbus frame integrity.
+        Expected: [Addr=123][Func=0x03][ByteCount=4][Float32 BE][CRC_Lo][CRC_Hi]
+        """
+        try:
+            data = bytes.fromhex(hex_data)
+            
+            # Minimum frame length
+            if len(data) < 9:
+                return False
+            
+            # Check slave address
+            if data[0] != self.SLAVE_ADDR:
+                return False
+            
+            # Check function code (0x03)
+            if data[1] != 0x03:
+                return False
+            
+            # Check byte count (0x04 for float32)
+            if data[2] != 0x04:
+                return False
+            
+            # Validate CRC
+            frame_len = len(data)
+            data_end = frame_len - 2
+            frame_without_crc = data[:data_end]
+            received_crc_bytes = data[data_end:]
+            received_crc = (received_crc_bytes[1] << 8) | received_crc_bytes[0]
+            calculated_crc = self._crc16_modbus(frame_without_crc)
+            
+            return calculated_crc == received_crc
+        except Exception as e:
+            print(f"[WaterLevelSensor] Validator error: {e}")
+            return False
 
     def parse_water_level(self, data) -> Optional[Dict[str, Any]]:
         """
@@ -125,15 +164,17 @@ class WaterLevelSensor:
 
     def read_data(
             self,
-            max_attempts: int = 12,
-            poll_interval: int = 5
+            timeout_sec: float = 30.0,
+            poll_interval_sec: float = 1.0,
+            echo_tag_hex: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Read water level data from the device.
+        Read water level data using send_and_wait (request-response matching).
 
         Args:
-            max_attempts: Maximum number of polling attempts
-            poll_interval: Seconds to wait between polling attempts
+            timeout_sec: Timeout in seconds
+            poll_interval_sec: Polling interval in seconds
+            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed water level data or None if reading fails
@@ -141,31 +182,26 @@ class WaterLevelSensor:
         try:
             token = self._ensure_token()
 
-            status, response = communicator.send_request(
+            # Use send_and_wait with strong response validator
+            status, hex_data = communicator.send_and_wait(
                 device_id=self.dev_eui,
                 data_to_send=self._read_cmd,
-                auth_token=token
+                auth_token=token,
+                response_validator=self._validate_response,
+                timeout_sec=timeout_sec,
+                fport=1,
+                reference="water-level-read",
+                min_interval_sec=self.min_send_interval_sec,
+                poll_interval_sec=poll_interval_sec,
+                echo_tag_hex=echo_tag_hex
             )
 
-            if status != 1:
-                print(f"Failed to send read command")
+            if status != 1 or hex_data is None:
+                print(f"Failed to read from device {self.dev_eui}")
                 return None
 
-            for attempt in range(1, max_attempts + 1):
-                time.sleep(poll_interval)
-
-                status, hex_data = communicator.pull_latest_data(
-                    device_id=self.dev_eui,
-                    auth_token=token,
-                    size=10
-                )
-
-                if status == 1 and hex_data:
-                    parsed_data = self.parse_water_level(hex_data)
-                    return parsed_data
-
-            print(f"No response received after {max_attempts} attempts")
-            return None
+            parsed_data = self.parse_water_level(hex_data)
+            return parsed_data
 
         except Exception as e:
             print(f"Error reading water level: {e}")
