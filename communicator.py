@@ -11,6 +11,7 @@ import threading
 import queue
 import base64
 import struct
+from datetime import datetime
 from typing import Optional, Tuple, Any, Dict, Callable, List
 from collections import defaultdict
 
@@ -99,14 +100,15 @@ else:
                 for u in uplinks_raw:
                     raw_b64 = u.get("data")
                     fport = u.get("fPort", 0)
-                    # Try to extract timestamp from API response
-                    ts = u.get("rxTime") or u.get("time") or time.time()
-                    if isinstance(ts, str):
+                    ts_str = u.get("insertTime")
+                    if ts_str:
                         try:
-                            # Parse ISO8601 or similar
-                            ts = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
-                        except:
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                        except Exception as e:
+                            print(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
                             ts = time.time()
+                    else:
+                        ts = time.time()
 
                     if raw_b64 and fport > 0:
                         try:
@@ -153,19 +155,17 @@ class DTUQueue:
         while True:
             try:
                 task = self._queue.get(timeout=0.1)
-                if task is None:  # shutdown signal
+                if task is None:
                     break
 
-                send_func, send_args, send_kwargs, result_holder = task
+                send_func, send_args, send_kwargs, result_holder, completion_event = task
 
-                # Enforce minimum interval
                 with self._lock:
                     elapsed = time.time() - self._last_send_time
                     if elapsed < self.min_interval_sec:
                         time.sleep(self.min_interval_sec - elapsed)
                     self._last_send_time = time.time()
 
-                # Execute send
                 try:
                     result = send_func(*send_args, **send_kwargs)
                     result_holder["result"] = result
@@ -173,31 +173,34 @@ class DTUQueue:
                 except Exception as e:
                     result_holder["result"] = None
                     result_holder["error"] = str(e)
+                finally:
+                    completion_event.set()
 
             except queue.Empty:
                 continue
 
-    def send(self, send_func: Callable, *args, **kwargs) -> Tuple[int, Optional[Any]]:
+    def send(self, send_func: Callable, *args, timeout: float = 30.0, **kwargs) -> Tuple[int, Optional[Any]]:
         """
         Queue a send operation and wait for result.
+
+        Args:
+            send_func: Function to execute
+            timeout: Timeout in seconds for waiting on result
+            *args, **kwargs: Arguments to pass to send_func
 
         Returns:
             tuple: (status, response) from send_func
         """
         result_holder = {"result": None, "error": None}
-        self._queue.put((send_func, args, kwargs, result_holder))
+        completion_event = threading.Event()
+        self._queue.put((send_func, args, kwargs, result_holder, completion_event))
 
-        # Wait for result (with timeout to avoid blocking forever)
-        timeout = 10
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if result_holder["result"] is not None or result_holder["error"] is not None:
-                if result_holder["error"]:
-                    return (0, None)
-                return result_holder["result"]
-            time.sleep(0.01)
-
-        return (0, None)
+        if completion_event.wait(timeout):
+            if result_holder["error"]:
+                return (0, None)
+            return result_holder["result"]
+        else:
+            return (0, None)
 
 
 # Global DTU queues
@@ -226,7 +229,8 @@ def send_request(
     auth_token: str,
     fport: int = 1,
     reference: str = "downlink-cmd",
-    min_interval_sec: float = 1.0
+    min_interval_sec: float = 1.0,
+    timeout: float = 30.0
 ) -> Tuple[int, Optional[Any]]:
     """
     Send downlink with per-DTU rate limiting.
@@ -238,6 +242,7 @@ def send_request(
         fport: LoRaWAN fPort
         reference: Reference identifier
         min_interval_sec: Minimum interval (seconds) between sends to this DTU
+        timeout: Timeout in seconds for waiting on send completion
 
     Returns:
         tuple: (status, response)
@@ -247,7 +252,7 @@ def send_request(
     def _do_send():
         return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
 
-    return queue.send(_do_send)
+    return queue.send(_do_send, timeout=timeout)
 
 
 def pull_latest_data(
@@ -285,16 +290,8 @@ def pull_latest_uplinks(
         tuple: (status, list of {ts, fport, hex, raw})
     """
     if USE_FAKE_DTU:
-        status, hex_data = _backend.pull_latest_data(device_id, auth_token, size)
-        if status != 1 or hex_data is None:
-            return (0, None)
-        # Wrap fake data with timestamp
-        return (1, [{
-            "ts": time.time(),
-            "fport": 1,
-            "hex": hex_data,
-            "raw": {}
-        }])
+        # Call fake backend's pull_latest_uplinks directly to preserve real timestamps
+        return _backend.pull_latest_uplinks(device_id, auth_token, size)
     else:
         return _backend.pull_latest_uplinks(device_id, auth_token, size)
 
@@ -308,9 +305,7 @@ def send_and_wait(
     fport: int = 1,
     reference: str = "downlink-cmd",
     min_interval_sec: float = 1.0,
-    poll_interval_sec: float = 1.0,
-    response_matcher: Optional[Callable[[Dict[str, Any]], bool]] = None,
-    echo_tag_hex: Optional[str] = None,
+    poll_interval_sec: float = 1.0
 ) -> Tuple[int, Optional[str]]:
     """
     Send request and wait for matching response.
@@ -320,11 +315,6 @@ def send_and_wait(
         data_to_send: Hex string to send
         auth_token: Auth token
         response_validator: Callable that returns True if uplink is the response for this request
-        response_matcher: Optional callable that receives full uplink dict (ts/fport/hex/raw)
-            and returns True only when this uplink matches the request (e.g., echo sequence number/random nonce)
-        echo_tag_hex: Optional hex string that must appear in the uplink hex. If provided,
-            uplinks that do not contain this tag are skipped. Use this when you put
-            unique identifiers in downlink and require echoing in uplink.
         timeout_sec: Timeout in seconds
         fport: LoRaWAN fPort for downlink
         reference: Reference identifier
@@ -337,11 +327,14 @@ def send_and_wait(
     # Send the request
     send_time = time.time()
     status, response = send_request(
-        device_id, data_to_send, auth_token, fport, reference, min_interval_sec
+        device_id,
+        data_to_send,
+        auth_token,
+        fport,
+        reference,
+        min_interval_sec=min_interval_sec,
+        timeout=timeout_sec,
     )
-
-    if echo_tag_hex:
-        print(f"[send_and_wait] request tag={echo_tag_hex} device={device_id}")
 
     if status != 1:
         print(f"[send_and_wait] Failed to send request to {device_id}")
@@ -356,33 +349,14 @@ def send_and_wait(
         if status != 1 or uplinks is None:
             continue
 
-        # Filter uplinks: only after send_time, optional tag/matcher, then pass validator
+        # Filter uplinks: only after send_time, and pass validator
         for uplink in uplinks:
             if uplink["ts"] < send_time:
                 continue  # Too old
 
             hex_data = uplink["hex"]
-
-            # If caller provided an echo tag, enforce it must appear in uplink
-            if echo_tag_hex:
-                if echo_tag_hex.lower() not in hex_data.lower():
-                    # Tag missing, skip but log once per candidate
-                    print(f"[send_and_wait] skip uplink: tag missing tag={echo_tag_hex} device={device_id} ts={uplink['ts']} hex={hex_data}")
-                    continue
-                else:
-                    print(f"[send_and_wait] candidate tag match tag={echo_tag_hex} device={device_id}")
-
-            # Optional extra match (e.g., sequence/nonce echoed back)
-            if response_matcher is not None:
-                try:
-                    if not response_matcher(uplink):
-                        continue
-                except Exception as e:
-                    print(f"[send_and_wait] Matcher error: {e}")
-                    continue
             try:
                 if response_validator(hex_data):
-                    print(f"[send_and_wait] accepted uplink tag={echo_tag_hex if echo_tag_hex else 'None'} device={device_id} ts={uplink['ts']} hex={hex_data}")
                     return (1, hex_data)
             except Exception as e:
                 print(f"[send_and_wait] Validator error: {e}")

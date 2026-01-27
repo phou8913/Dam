@@ -165,8 +165,7 @@ class WaterLevelSensor:
     def read_data(
             self,
             timeout_sec: float = 30.0,
-            poll_interval_sec: float = 1.0,
-            echo_tag_hex: Optional[str] = None
+            poll_interval_sec: float = 1.0
     ) -> Optional[Dict[str, Any]]:
         """
         Read water level data using send_and_wait (request-response matching).
@@ -174,7 +173,6 @@ class WaterLevelSensor:
         Args:
             timeout_sec: Timeout in seconds
             poll_interval_sec: Polling interval in seconds
-            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed water level data or None if reading fails
@@ -192,8 +190,7 @@ class WaterLevelSensor:
                 fport=1,
                 reference="water-level-read",
                 min_interval_sec=self.min_send_interval_sec,
-                poll_interval_sec=poll_interval_sec,
-                echo_tag_hex=echo_tag_hex
+                poll_interval_sec=poll_interval_sec
             )
 
             if status != 1 or hex_data is None:

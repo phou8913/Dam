@@ -283,6 +283,12 @@ class FakeSharedDTU(FakeDTU):
             return None
         return self._last_used.pull_latest(size=size)
 
+    def pull_latest_uplinks(self, size: int = 10) -> Optional[List[Dict[str, Any]]]:
+        """Pull latest uplinks from the DTU that was just used."""
+        if self._last_used is None:
+            return None
+        return self._last_used.pull_latest_uplinks(size=size)
+
 
 # -----------------------------
 # Fake Gateway: maps dev_eui -> DTU

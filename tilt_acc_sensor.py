@@ -175,8 +175,7 @@ class HWT901BSensor:
             self,
             timeout_sec: float = 30.0,
             poll_interval_sec: float = 1.0,
-            auto_unlock: bool = True,
-            echo_tag_hex: Optional[str] = None,
+            auto_unlock: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
         Read angle data from the device using send_and_wait.
@@ -185,7 +184,6 @@ class HWT901BSensor:
             timeout_sec: Timeout in seconds
             poll_interval_sec: Polling interval in seconds
             auto_unlock: Automatically send unlock command before reading
-            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed angle data or None if reading fails
@@ -216,8 +214,7 @@ class HWT901BSensor:
                 fport=1,
                 reference="angles-read",
                 min_interval_sec=self.min_send_interval_sec,
-                poll_interval_sec=poll_interval_sec,
-                echo_tag_hex=echo_tag_hex,
+                poll_interval_sec=poll_interval_sec
             )
 
             if status != 1 or hex_data is None:
@@ -235,8 +232,7 @@ class HWT901BSensor:
             self,
             timeout_sec: float = 30.0,
             poll_interval_sec: float = 1.0,
-            auto_unlock: bool = True,
-            echo_tag_hex: Optional[str] = None,
+            auto_unlock: bool = True
     ) -> Optional[Dict[str, Any]]:
         """
         Read acceleration data from the device using send_and_wait.
@@ -245,7 +241,6 @@ class HWT901BSensor:
             timeout_sec: Timeout in seconds
             poll_interval_sec: Polling interval in seconds
             auto_unlock: Automatically send unlock command before reading
-            echo_tag_hex: Optional hex tag to enforce uplink echo matching
 
         Returns:
             dict: Parsed acceleration data or None if reading fails
@@ -276,8 +271,7 @@ class HWT901BSensor:
                 fport=1,
                 reference="accel-read",
                 min_interval_sec=self.min_send_interval_sec,
-                poll_interval_sec=poll_interval_sec,
-                echo_tag_hex=echo_tag_hex,
+                poll_interval_sec=poll_interval_sec
             )
 
             if status != 1 or hex_data is None:
