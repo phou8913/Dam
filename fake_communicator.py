@@ -3,7 +3,24 @@ import time
 import struct
 import random
 import math
+import threading
 from typing import Optional, Tuple, Any, Dict, List
+
+
+# Global lock and timestamp for ensuring unique timestamps
+_TIMESTAMP_LOCK = threading.Lock()
+_LAST_GLOBAL_TS = 0.0
+
+
+def _get_unique_timestamp() -> float:
+    """Get a unique, monotonically increasing timestamp."""
+    global _LAST_GLOBAL_TS
+    with _TIMESTAMP_LOCK:
+        current_ts = time.time()
+        if current_ts <= _LAST_GLOBAL_TS:
+            current_ts = _LAST_GLOBAL_TS + 0.000001
+        _LAST_GLOBAL_TS = current_ts
+        return current_ts
 
 
 # -----------------------------
@@ -55,9 +72,9 @@ class FakeDTU:
         return
 
     def push_uplink_hex(self, payload_hex: str, fport: int = 1) -> None:
-        """Push uplink with timestamp."""
+        """Push uplink with unique, monotonically increasing timestamp."""
         uplink = {
-            "ts": time.time(),
+            "ts": _get_unique_timestamp(),
             "hex": payload_hex,
             "fport": fport
         }
@@ -187,16 +204,19 @@ class FakeTiltAccDTU(FakeDTU):
 # -----------------------------
 class FakeWaterLevelDTU(FakeDTU):
     SLAVE_ADDR = 123
+    _lock = threading.Lock()  # Per-class lock to serialize on_downlink calls
 
     def on_downlink(self, data_to_send_hex: str, fport: int, reference: str) -> None:
         super().on_downlink(data_to_send_hex, fport, reference)
 
-        level_m = random.uniform(0.05, 0.50)
-        header = struct.pack(">BBB", self.SLAVE_ADDR, 0x03, 0x04)
-        data4 = struct.pack(">f", float(level_m))
-        frame_wo_crc = header + data4
-        frame = _append_crc_le(frame_wo_crc)
-        self.push_uplink_hex(frame.hex(), fport=1)
+        # Serialize the entire generation and push process to avoid race conditions
+        with self._lock:
+            level_m = random.uniform(0.05, 0.50)
+            header = struct.pack(">BBB", self.SLAVE_ADDR, 0x03, 0x04)
+            data4 = struct.pack(">f", float(level_m))
+            frame_wo_crc = header + data4
+            frame = _append_crc_le(frame_wo_crc)
+            self.push_uplink_hex(frame.hex(), fport=1)
 
 
 # -----------------------------

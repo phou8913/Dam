@@ -207,6 +207,10 @@ class DTUQueue:
 _DTU_QUEUES: Dict[str, DTUQueue] = {}
 _QUEUE_LOCK = threading.Lock()
 
+# Track last response timestamp per device to avoid reusing responses
+_LAST_RESPONSE_TS: Dict[str, float] = {}
+_RESPONSE_TS_LOCK = threading.Lock()
+
 
 def _get_dtu_queue(dev_eui: str, min_interval_sec: float = 1.0) -> DTUQueue:
     """Get or create DTU queue."""
@@ -349,14 +353,26 @@ def send_and_wait(
         if status != 1 or uplinks is None:
             continue
 
-        # Filter uplinks: only after send_time, and pass validator
+        # Filter uplinks: only after send_time AND after last response timestamp, and pass validator
         for uplink in uplinks:
+            # Re-read last_resp_ts for each uplink to catch updates from other threads
+            with _RESPONSE_TS_LOCK:
+                last_resp_ts = _LAST_RESPONSE_TS.get(device_id, 0.0)
+            
+            if uplink["ts"] <= last_resp_ts:
+                continue  # Already used this response before
             if uplink["ts"] < send_time:
                 continue  # Too old
 
             hex_data = uplink["hex"]
             try:
                 if response_validator(hex_data):
+                    # Mark this response as used (atomic check-and-set)
+                    with _RESPONSE_TS_LOCK:
+                        # Double-check: another thread might have used it while we were validating
+                        if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
+                            continue
+                        _LAST_RESPONSE_TS[device_id] = uplink["ts"]
                     return (1, hex_data)
             except Exception as e:
                 print(f"[send_and_wait] Validator error: {e}")
