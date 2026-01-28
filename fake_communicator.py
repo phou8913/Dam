@@ -7,6 +7,14 @@ import threading
 from typing import Optional, Tuple, Any, Dict, List
 
 
+# ==================== Simulation Configuration ====================
+# Adjust these to test different network conditions
+SIM_PACKET_LOSS_RATE = 0.5       # 0.0 = no loss, 0.1 = 10% loss
+SIM_DELAY_RATE = 0.5             # 0.0 = no delay, 0.3 = 30% of requests get delayed
+SIM_DELAY_SEC = 25             # How long the delay is (in seconds)
+SIM_VERBOSE = True               # Print debug messages
+
+
 # Global lock and timestamp for ensuring unique timestamps
 _TIMESTAMP_LOCK = threading.Lock()
 _LAST_GLOBAL_TS = 0.0
@@ -349,11 +357,35 @@ def send_request(
     fport: int = 1,
     reference: str = "downlink-cmd"
 ) -> Tuple[int, Optional[Any]]:
+    # ========== Simulate Packet Loss ==========
+    if random.random() < SIM_PACKET_LOSS_RATE:
+        if SIM_VERBOSE:
+            print(f"[FAKE] Packet loss! Request to {device_id} dropped (no uplink generated)")
+        # Simulate loss: accept the request but don't generate uplink
+        return 1, {"fake": True, "device_id": device_id, "reference": reference, "status": "packet_lost"}
+    
+    # ========== Simulate Delay ==========
+    if random.random() < SIM_DELAY_RATE:
+        if SIM_VERBOSE:
+            print(f"[FAKE] Simulating {SIM_DELAY_SEC}s delay for {device_id}...")
+        # Delay in background thread to avoid blocking
+        def delayed_response():
+            time.sleep(SIM_DELAY_SEC)
+            dtu = _GATEWAY.get_or_create(device_id)
+            dtu.on_downlink(data_to_send_hex=data_to_send, fport=fport, reference=reference)
+            if SIM_VERBOSE:
+                print(f"[FAKE] Delayed response arrived for {device_id}")
+        
+        thread = threading.Thread(target=delayed_response, daemon=True)
+        thread.start()
+        return 1, {"fake": True, "device_id": device_id, "reference": reference, "status": "delayed"}
+    
+    # ========== Normal Response ==========
     dtu = _GATEWAY.get_or_create(device_id)
     dtu.on_downlink(data_to_send_hex=data_to_send, fport=fport, reference=reference)
 
     # mimic server response structure
-    return 1, {"fake": True, "device_id": device_id, "reference": reference}
+    return 1, {"fake": True, "device_id": device_id, "reference": reference, "status": "success"}
 
 
 def pull_latest_data(

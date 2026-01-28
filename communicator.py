@@ -64,7 +64,7 @@ else:
                     "content-type": "application/json"
                 }
                 payload = {
-                    "confirmed": False,
+                    "confirmed": True,  ### important
                     "mode": "hex",
                     "data": data_to_send,
                     "fPort": fport,
@@ -211,6 +211,21 @@ _QUEUE_LOCK = threading.Lock()
 _LAST_RESPONSE_TS: Dict[str, float] = {}
 _RESPONSE_TS_LOCK = threading.Lock()
 
+# ==================== Per-DTU Inflight Lock ====================
+# Ensures that send_and_wait() for the same devEUI runs serially,
+# preventing multiple requests from competing for the same uplink response.
+_INFLIGHT_LOCKS: Dict[str, threading.Lock] = {}
+_INFLIGHT_LOCKS_GUARD = threading.Lock()
+
+def _get_inflight_lock(dev_eui: str) -> threading.Lock:
+    """Get or create the per-DTU inflight lock."""
+    with _INFLIGHT_LOCKS_GUARD:
+        lock = _INFLIGHT_LOCKS.get(dev_eui)
+        if lock is None:
+            lock = threading.Lock()
+            _INFLIGHT_LOCKS[dev_eui] = lock
+        return lock
+
 
 def _get_dtu_queue(dev_eui: str, min_interval_sec: float = 1.0) -> DTUQueue:
     """Get or create DTU queue."""
@@ -313,6 +328,10 @@ def send_and_wait(
 ) -> Tuple[int, Optional[str]]:
     """
     Send request and wait for matching response.
+    
+    Uses per-DTU inflight lock to ensure that requests to the same device_id
+    are processed serially (send + wait + consume), preventing response mismatching
+    when multiple threads are sending to the same DTU.
 
     Args:
         device_id: Device EUI
@@ -328,57 +347,61 @@ def send_and_wait(
     Returns:
         tuple: (status, hex_response_string) or (0, None) on timeout/failure
     """
-    # Send the request
-    send_time = time.time()
-    status, response = send_request(
-        device_id,
-        data_to_send,
-        auth_token,
-        fport,
-        reference,
-        min_interval_sec=min_interval_sec,
-        timeout=timeout_sec,
-    )
+    # Acquire per-DTU inflight lock to serialize send+wait for same device
+    lock = _get_inflight_lock(device_id)
+    
+    with lock:
+        # Send the request
+        send_time = time.time()
+        status, response = send_request(
+            device_id,
+            data_to_send,
+            auth_token,
+            fport,
+            reference,
+            min_interval_sec=min_interval_sec,
+            timeout=timeout_sec,
+        )
 
-    if status != 1:
-        print(f"[send_and_wait] Failed to send request to {device_id}")
-        return (0, None)
+        if status != 1:
+            print(f"[send_and_wait] Failed to send request to {device_id}")
+            return (0, None)
 
-    # Poll for response
-    deadline = send_time + timeout_sec
-    while time.time() < deadline:
-        time.sleep(poll_interval_sec)
+        # Poll for response
+        deadline = send_time + timeout_sec
+        while time.time() < deadline:
+            time.sleep(poll_interval_sec)
 
-        status, uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
-        if status != 1 or uplinks is None:
-            continue
-
-        # Filter uplinks: only after send_time AND after last response timestamp, and pass validator
-        for uplink in uplinks:
-            # Re-read last_resp_ts for each uplink to catch updates from other threads
-            with _RESPONSE_TS_LOCK:
-                last_resp_ts = _LAST_RESPONSE_TS.get(device_id, 0.0)
-            
-            if uplink["ts"] <= last_resp_ts:
-                continue  # Already used this response before
-            if uplink["ts"] < send_time:
-                continue  # Too old
-
-            hex_data = uplink["hex"]
-            try:
-                if response_validator(hex_data):
-                    # Mark this response as used (atomic check-and-set)
-                    with _RESPONSE_TS_LOCK:
-                        # Double-check: another thread might have used it while we were validating
-                        if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
-                            continue
-                        _LAST_RESPONSE_TS[device_id] = uplink["ts"]
-                    return (1, hex_data)
-            except Exception as e:
-                print(f"[send_and_wait] Validator error: {e}")
+            status, uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
+            if status != 1 or uplinks is None:
                 continue
 
-    print(f"[send_and_wait] Timeout waiting for response from {device_id}")
-    return (0, None)
+            # Filter uplinks: only after send_time AND after last response timestamp, and pass validator
+            for uplink in uplinks:
+                # Re-read last_resp_ts for each uplink to catch updates from other threads
+                with _RESPONSE_TS_LOCK:
+                    last_resp_ts = _LAST_RESPONSE_TS.get(device_id, 0.0)
+                
+                if uplink["ts"] <= last_resp_ts:
+                    continue  # Already used this response before
+                if uplink["ts"] < send_time:
+                    continue  # Too old
+
+                hex_data = uplink["hex"]
+                try:
+                    if response_validator(hex_data):
+                        # Mark this response as used (atomic check-and-set)
+                        with _RESPONSE_TS_LOCK:
+                            # Double-check: another thread might have used it while we were validating
+                            if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
+                                continue
+                            _LAST_RESPONSE_TS[device_id] = uplink["ts"]
+                        return (1, hex_data)
+                except Exception as e:
+                    print(f"[send_and_wait] Validator error: {e}")
+                    continue
+
+        print(f"[send_and_wait] Timeout waiting for response from {device_id}")
+        return (0, None)
 
 
