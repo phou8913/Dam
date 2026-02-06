@@ -5,39 +5,21 @@ Reads float value representing water level in meters.
 """
 
 import struct
-import time
 from typing import Optional, Dict, Any
-
-import communicator
 
 
 class WaterLevelSensor:
     """
-    Water Level Sensor Interface.
-    Handles water level data retrieval and parsing from Modbus device.
+    Water Level Sensor Profile.
+    Only handles command byte generation and response decoding.
     """
 
     SLAVE_ADDR = 123
 
-    def __init__(self, dev_eui: str, token=None, min_send_interval_sec: float = 1.0):
-        """
-        Initialize the sensor with device EUI.
-
-        Args:
-            dev_eui: Device EUI identifier for the LoRa sensor
-            token: Optional JWT token
-            min_send_interval_sec: Minimum interval (seconds) between sends to this DTU
-        """
-        self.dev_eui = dev_eui
-        self._token = token
-        self.min_send_interval_sec = min_send_interval_sec
-        self._read_cmd = self._make_read_command()
-
-    def _ensure_token(self):
-        """Ensure we have a valid authentication token."""
-        if self._token is None:
-            self._token = communicator.get_token()
-        return self._token
+    @classmethod
+    def encode_read_command(cls) -> str:
+        """Generate the Modbus read command bytes as hex string."""
+        return cls._make_read_command()
 
     @staticmethod
     def _crc16_modbus(data: bytes) -> int:
@@ -52,18 +34,19 @@ class WaterLevelSensor:
                     crc >>= 1
         return crc & 0xFFFF
 
-    def _make_read_command(self) -> str:
+    @classmethod
+    def _make_read_command(cls) -> str:
         """
         Create Modbus RTU read holding registers command.
         Slave: 123, Function: 0x03, Start: 0x0000, Count: 0x0002
         """
-        frame = struct.pack('>BBHH', self.SLAVE_ADDR, 0x03, 0x0000, 0x0002)
-        crc = self._crc16_modbus(frame)
+        frame = struct.pack('>BBHH', cls.SLAVE_ADDR, 0x03, 0x0000, 0x0002)
+        crc = cls._crc16_modbus(frame)
         crc_bytes = struct.pack('<H', crc)
         full_frame = frame + crc_bytes
         return full_frame.hex()
 
-    def _validate_response(self, hex_data: str) -> bool:
+    def validate_response(self, hex_data: str) -> bool:
         """
         Strong validator: check Modbus frame integrity.
         Expected: [Addr=123][Func=0x03][ByteCount=4][Float32 BE][CRC_Lo][CRC_Hi]
@@ -162,58 +145,6 @@ class WaterLevelSensor:
             print(f"Error parsing water level: {e}")
             return None
 
-    def read_data(
-            self,
-            timeout_sec: float = 30.0,
-            poll_interval_sec: float = 1.0
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Read water level data using send_and_wait (request-response matching).
-
-        Args:
-            timeout_sec: Timeout in seconds
-            poll_interval_sec: Polling interval in seconds
-
-        Returns:
-            dict: Parsed water level data or None if reading fails
-        """
-        try:
-            token = self._ensure_token()
-
-            # Use send_and_wait with strong response validator
-            status, hex_data = communicator.send_and_wait(
-                device_id=self.dev_eui,
-                data_to_send=self._read_cmd,
-                auth_token=token,
-                response_validator=self._validate_response,
-                timeout_sec=timeout_sec,
-                fport=1,
-                reference="water-level-read",
-                min_interval_sec=self.min_send_interval_sec,
-                poll_interval_sec=poll_interval_sec
-            )
-
-            if status != 1 or hex_data is None:
-                print(f"Failed to read from device {self.dev_eui}")
-                return None
-
-            parsed_data = self.parse_water_level(hex_data)
-            return parsed_data
-
-        except Exception as e:
-            print(f"Error reading water level: {e}")
-            return None
-
-
-if __name__ == "__main__":
-    DEV_EUI = "8695311000942380"
-
-    sensor = WaterLevelSensor(dev_eui=DEV_EUI)
-    data = sensor.read_data()
-
-    if data:
-        print(f"Water Level: {data['level_m']:.3f} m")
-        print(f"CRC Valid: {data['crc_valid']}")
-        print(f"Raw: {data['raw_hex']}")
-    else:
-        print("Failed to read water level")
+    def decode_response(self, data) -> Optional[Dict[str, Any]]:
+        """Decode response bytes/hex into water level value."""
+        return self.parse_water_level(data)

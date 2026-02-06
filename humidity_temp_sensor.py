@@ -4,40 +4,22 @@ Parses Modbus RTU response frames from LoRa-connected environmental sensors.
 """
 
 import struct
-import time
 from typing import Optional, Dict, Any
-
-# Import the communicator module for API interaction
-import communicator
 
 
 class HumidityTempSensor:
     """
-    Humidity and Temperature Sensor Interface.
-    Handles communication, Modbus RTU response parsing, and data retrieval.
+    Humidity and Temperature Sensor Profile.
+    Only handles command byte generation and response decoding.
     """
 
     # Modbus command to read 3 registers: T, H, D
     MODBUS_READ_CMD = "010400000003B00B"
 
-    def __init__(self, dev_eui: str, token=None, min_send_interval_sec: float = 1.0):
-        """
-        Initialize the sensor with device EUI.
-
-        Args:
-            dev_eui: Device EUI identifier for the LoRa sensor
-            token: Optional JWT token
-            min_send_interval_sec: Minimum interval (seconds) between sends to this DTU
-        """
-        self.dev_eui = dev_eui
-        self._token = token
-        self.min_send_interval_sec = min_send_interval_sec
-
-    def _ensure_token(self):
-        """Ensure we have a valid authentication token."""
-        if self._token is None:
-            self._token = communicator.get_token()
-        return self._token
+    @classmethod
+    def encode_read_command(cls) -> str:
+        """Generate the Modbus read command bytes as hex string."""
+        return cls.MODBUS_READ_CMD
 
     @staticmethod
     def _crc16_modbus(data: bytes) -> int:
@@ -86,7 +68,7 @@ class HumidityTempSensor:
         """
         return struct.unpack(">H", b)[0]
 
-    def _validate_response(self, hex_data: str) -> bool:
+    def validate_response(self, hex_data: str) -> bool:
         """
         Strong validator: check Modbus frame integrity.
         Expected: [01][04][06][T_Hi][T_Lo][H_Hi][H_Lo][D_Hi][D_Lo][CRC_Lo][CRC_Hi]
@@ -197,62 +179,6 @@ class HumidityTempSensor:
             print(f"Error during value parsing: {e}")
             return None
 
-    def read_data(
-        self,
-        timeout_sec: float = 30.0,
-        poll_interval_sec: float = 1.0
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Read live sensor data using send_and_wait (request-response matching).
-
-        Args:
-            timeout_sec: Timeout in seconds
-            poll_interval_sec: Polling interval in seconds
-
-        Returns:
-            dict: Parsed sensor data or None if reading fails
-        """
-        try:
-            token = self._ensure_token()
-
-            # Use send_and_wait with strong response validator
-            status, hex_data = communicator.send_and_wait(
-                device_id=self.dev_eui,
-                data_to_send=self.MODBUS_READ_CMD,
-                auth_token=token,
-                response_validator=self._validate_response,
-                timeout_sec=timeout_sec,
-                fport=1,
-                reference="humidity-read",
-                min_interval_sec=self.min_send_interval_sec,
-                poll_interval_sec=poll_interval_sec
-            )
-
-            if status != 1 or hex_data is None:
-                print(f"Failed to read from device {self.dev_eui}")
-                return None
-
-            parsed_data = self.parse_humidity_sensor_data(hex_data)
-            return parsed_data
-
-        except Exception as e:
-            print(f"Error reading sensor data: {e}")
-            return None
-
-
-# ============ Main ============
-
-if __name__ == "__main__":
-    DEV_EUI = "8695311000931640"
-
-    sensor = HumidityTempSensor(dev_eui=DEV_EUI)
-    data = sensor.read_data()
-
-    if data:
-        print(f"Temperature: {data['temperature_c']:.2f} °C")
-        print(f"Humidity: {data['humidity_rh']:.2f} %RH")
-        print(f"Dewpoint: {data['dewpoint_c']:.2f} °C")
-        print(f"CRC Valid: {data['crc_valid']}")
-        print(f"Raw: {data['raw_hex']}")
-    else:
-        print("Failed to read sensor data")
+    def decode_response(self, data) -> Optional[Dict[str, Any]]:
+        """Decode response bytes/hex into sensor values."""
+        return self.parse_humidity_sensor_data(data)

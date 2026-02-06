@@ -21,6 +21,7 @@ from humidity_temp_sensor import HumidityTempSensor
 from tilt_acc_sensor import HWT901BSensor
 from water_level_sensor import WaterLevelSensor
 from mmwave_sensor import MMWaveSensor
+import communicator
 
 
 # Global Device EUI Defaults
@@ -404,8 +405,23 @@ class SensorDashboard:
         dev_eui = self.ht_eui_entry.get().strip()
         self.log_terminal("\n--- Humidity/Temperature Sensor ---")
         try:
-            sensor = HumidityTempSensor(dev_eui=dev_eui, min_send_interval_sec=1.0)
-            data = sensor.read_data(timeout_sec=15.0, poll_interval_sec=1.0)
+            profile = HumidityTempSensor()
+            token = communicator.get_token()
+            cmd_hex = profile.encode_read_command()
+
+            status, hex_data = communicator.send_and_wait(
+                device_id=dev_eui,
+                data_to_send=cmd_hex,
+                auth_token=token,
+                response_validator=profile.validate_response,
+                timeout_sec=15.0,
+                fport=1,
+                reference="humidity-read",
+                min_interval_sec=1.0,
+                poll_interval_sec=1.0
+            )
+
+            data = profile.decode_response(hex_data) if status == 1 and hex_data else None
 
             if data:
                 self.log_terminal(f"Temperature: {data['temperature_c']:.2f} °C")
@@ -424,17 +440,52 @@ class SensorDashboard:
         dev_eui = self.ta_eui_entry.get().strip()
         self.log_terminal("\n--- Tilt/Acceleration Sensor ---")
         try:
-            sensor = HWT901BSensor(dev_eui=dev_eui, min_send_interval_sec=1.0)
+            profile = HWT901BSensor()
+            token = communicator.get_token()
 
             # Read angles
-            angles = sensor.read_angles(timeout_sec=15.0, poll_interval_sec=1.0)
+            unlock_cmd = profile.encode_unlock_command()
+            status, _ = communicator.send_request(
+                device_id=dev_eui,
+                data_to_send=unlock_cmd,
+                auth_token=token,
+                min_interval_sec=1.0
+            )
+            if status != 1:
+                self.log_terminal("Failed to send unlock command")
+                return
+            time.sleep(0.5)
+
+            angles_status, angles_hex = communicator.send_and_wait(
+                device_id=dev_eui,
+                data_to_send=profile.encode_read_angles_command(),
+                auth_token=token,
+                response_validator=profile.validate_angles_response,
+                timeout_sec=15.0,
+                fport=1,
+                reference="angles-read",
+                min_interval_sec=1.0,
+                poll_interval_sec=1.0
+            )
+            angles = profile.decode_angles(angles_hex) if angles_status == 1 and angles_hex else None
             if angles:
                 self.log_terminal(f"Roll: {angles['roll']:.2f}°")
                 self.log_terminal(f"Pitch: {angles['pitch']:.2f}°")
                 self.log_terminal(f"Yaw: {angles['yaw']:.2f}°")
 
                 # Read acceleration
-                accel = sensor.read_acceleration(timeout_sec=15.0, poll_interval_sec=1.0, auto_unlock=False)
+                accel_status, accel_hex = communicator.send_and_wait(
+                    device_id=dev_eui,
+                    data_to_send=profile.encode_read_accel_command(),
+                    auth_token=token,
+                    response_validator=profile.validate_accel_response,
+                    timeout_sec=15.0,
+                    fport=1,
+                    reference="accel-read",
+                    min_interval_sec=1.0,
+                    poll_interval_sec=1.0
+                )
+                accel = profile.decode_acceleration(accel_hex) if accel_status == 1 and accel_hex else None
                 if accel:
                     self.log_terminal(f"Ax: {accel['ax_g']:.3f}g ({accel['ax_ms2']:.2f} m/s²)")
                     self.log_terminal(f"Ay: {accel['ay_g']:.3f}g ({accel['ay_ms2']:.2f} m/s²)")
@@ -454,8 +505,23 @@ class SensorDashboard:
         dev_eui = self.wl_eui_entry.get().strip()
         self.log_terminal("\n--- Water Level Sensor ---")
         try:
-            sensor = WaterLevelSensor(dev_eui=dev_eui, min_send_interval_sec=1.0)
-            data = sensor.read_data(timeout_sec=15.0, poll_interval_sec=1.0)
+            profile = WaterLevelSensor()
+            token = communicator.get_token()
+            cmd_hex = profile.encode_read_command()
+
+            status, hex_data = communicator.send_and_wait(
+                device_id=dev_eui,
+                data_to_send=cmd_hex,
+                auth_token=token,
+                response_validator=profile.validate_response,
+                timeout_sec=15.0,
+                fport=1,
+                reference="water-level-read",
+                min_interval_sec=1.0,
+                poll_interval_sec=1.0
+            )
+
+            data = profile.decode_response(hex_data) if status == 1 and hex_data else None
 
             if data:
                 self.log_terminal(f"Water Level: {data['level_m']:.3f} m")
@@ -472,8 +538,14 @@ class SensorDashboard:
         dev_eui = self.mmwave_eui_entry.get().strip()
         self.log_terminal("\n--- mmWave Radar Sensor ---")
         try:
-            sensor = MMWaveSensor(dev_eui=dev_eui)
-            targets = sensor.read_data(max_attempts=1, poll_interval=self.poll_interval)
+            profile = MMWaveSensor()
+            token = communicator.get_token()
+            status, hex_data = communicator.pull_latest_data(
+                device_id=dev_eui,
+                auth_token=token,
+                size=10
+            )
+            targets = profile.decode_targets(hex_data) if status == 1 and hex_data else None
 
             if targets:
                 self.mmwave_targets = targets

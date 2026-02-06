@@ -16,122 +16,119 @@ from typing import Optional, Tuple, Any, Dict, Callable, List
 from collections import defaultdict
 
 
-# ==================== Determine Backend ====================
-USE_FAKE_DTU = os.getenv("USE_FAKE_DTU") == "1"
+# ==================== Import Configuration ====================
+import requests
+import config
 
-if USE_FAKE_DTU:
-    import fake_communicator as _backend
-else:
-    class _RealBackend:
-        """Real LoRa API communicator"""
-        import requests
+class _Backend:
+    """Unified LoRa API communicator (works with real or fake HTTP server)"""
+    
+    BASE_URL = config.BASE_URL
+    ACCOUNT = config.ACCOUNT
+    PASSWORD = config.PASSWORD
 
-        BASE_URL = "http://99.10.226.29:4560/api"
-        ACCOUNT = "admin"
-        PASSWORD = "admin"
+    @staticmethod
+    def get_token() -> str:
+        """Authenticate with the API and retrieve JWT token."""
+        url = f"{_Backend.BASE_URL}/v1/internal/auth"
+        payload = {
+            "account": _Backend.ACCOUNT,
+            "password": _Backend.PASSWORD
+        }
+        try:
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+            token = response.json().get("token")
+            if not token:
+                raise RuntimeError("Authentication successful but no token received")
+            return token
+        except Exception as e:
+            raise RuntimeError(f"Failed to authenticate: {e}")
 
-        @staticmethod
-        def get_token() -> str:
-            """Authenticate with the API and retrieve JWT token."""
-            url = f"{_RealBackend.BASE_URL}/v1/internal/auth"
-            payload = {
-                "account": _RealBackend.ACCOUNT,
-                "password": _RealBackend.PASSWORD
+    @staticmethod
+    def send_request(
+        device_id: str,
+        data_to_send: str,
+        auth_token: str,
+        fport: int = 1,
+        reference: str = "downlink-cmd"
+    ) -> Tuple[int, Optional[Any]]:
+        """Send downlink request to a LoRa device."""
+        try:
+            url = f"{_Backend.BASE_URL}/v1/devices/{device_id}/queue"
+            headers = {
+                "token": auth_token,
+                "content-type": "application/json"
             }
-            try:
-                response = _RealBackend.requests.post(url, json=payload)
-                response.raise_for_status()
-                token = response.json().get("token")
-                if not token:
-                    raise RuntimeError("Authentication successful but no token received")
-                return token
-            except Exception as e:
-                raise RuntimeError(f"Failed to authenticate: {e}")
+            payload = {
+                "confirmed": True,
+                "mode": "hex",
+                "data": data_to_send,
+                "fPort": fport,
+                "reference": reference
+            }
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return (1, response.json())
+        except Exception as e:
+            print(f"Error sending request: {e}")
+            return (0, None)
 
-        @staticmethod
-        def send_request(
-            device_id: str,
-            data_to_send: str,
-            auth_token: str,
-            fport: int = 1,
-            reference: str = "downlink-cmd"
-        ) -> Tuple[int, Optional[Any]]:
-            """Send downlink request to a LoRa device."""
-            try:
-                url = f"{_RealBackend.BASE_URL}/v1/devices/{device_id}/queue"
-                headers = {
-                    "token": auth_token,
-                    "content-type": "application/json"
-                }
-                payload = {
-                    "confirmed": True,  ### important
-                    "mode": "hex",
-                    "data": data_to_send,
-                    "fPort": fport,
-                    "reference": reference
-                }
-                response = _RealBackend.requests.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                return (1, response.json())
-            except Exception as e:
-                print(f"Error sending request: {e}")
-                return (0, None)
+    @staticmethod
+    def pull_latest_uplinks(
+        device_id: str,
+        auth_token: str,
+        size: int = 10
+    ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+        """
+        Pull latest uplinks with timestamp and metadata.
+        Returns list of dicts: {ts, fport, hex, ...}
+        """
+        try:
+            url = f"{_Backend.BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
+            headers = {"token": auth_token}
+            params = {"size": size, "page": 1}
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
 
-        @staticmethod
-        def pull_latest_uplinks(
-            device_id: str,
-            auth_token: str,
-            size: int = 10
-        ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-            """
-            Pull latest uplinks with timestamp and metadata.
-            Returns list of dicts: {ts, fport, hex, ...}
-            """
-            try:
-                url = f"{_RealBackend.BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
-                headers = {"token": auth_token}
-                params = {"size": size, "page": 1}
-                response = _RealBackend.requests.get(url, headers=headers, params=params)
-                response.raise_for_status()
+            uplinks_raw = response.json().get("result", [])
+            uplinks = []
 
-                uplinks_raw = response.json().get("result", [])
-                uplinks = []
-
-                for u in uplinks_raw:
-                    raw_b64 = u.get("data")
-                    fport = u.get("fPort", 0)
-                    ts_str = u.get("insertTime")
-                    if ts_str:
-                        try:
-                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                        except Exception as e:
-                            print(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
-                            ts = time.time()
-                    else:
+            for u in uplinks_raw:
+                raw_b64 = u.get("data")
+                fport = u.get("fPort", 0)
+                ts_str = u.get("insertTime")
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                    except Exception as e:
+                        print(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
                         ts = time.time()
+                else:
+                    ts = time.time()
 
-                    if raw_b64 and fport > 0:
-                        try:
-                            raw_bytes = base64.b64decode(raw_b64)
-                            hex_data = raw_bytes.hex()
-                            uplinks.append({
-                                "ts": ts,
-                                "fport": fport,
-                                "hex": hex_data,
-                                "raw": u
-                            })
-                        except Exception as e:
-                            print(f"Warning: Failed to decode uplink: {e}")
+                if raw_b64 and fport > 0:
+                    try:
+                        raw_bytes = base64.b64decode(raw_b64)
+                        hex_data = raw_bytes.hex()
+                        uplinks.append({
+                            "ts": ts,
+                            "fport": fport,
+                            "hex": hex_data,
+                            "raw": u
+                        })
+                    except Exception as e:
+                        print(f"Warning: Failed to decode uplink: {e}")
 
-                if uplinks:
-                    return (1, uplinks)
-                return (0, None)
+            if uplinks:
+                return (1, uplinks)
+            return (0, None)
 
-            except Exception as e:
-                print(f"Error pulling uplinks: {e}")
-                return (0, None)
+        except Exception as e:
+            print(f"Error pulling uplinks: {e}")
+            return (0, None)
 
-    _backend = _RealBackend()
+_backend = _Backend()
 
 
 # ==================== Per-DTU Rate Limiter ====================
@@ -308,11 +305,7 @@ def pull_latest_uplinks(
     Returns:
         tuple: (status, list of {ts, fport, hex, raw})
     """
-    if USE_FAKE_DTU:
-        # Call fake backend's pull_latest_uplinks directly to preserve real timestamps
-        return _backend.pull_latest_uplinks(device_id, auth_token, size)
-    else:
-        return _backend.pull_latest_uplinks(device_id, auth_token, size)
+    return _backend.pull_latest_uplinks(device_id, auth_token, size)
 
 
 def send_and_wait(

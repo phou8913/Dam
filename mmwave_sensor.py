@@ -5,34 +5,14 @@ Data format: [Dist_Hi, Dist_Lo, Angle_Hi, Angle_Lo] per target (4 bytes each)
 """
 
 import struct
-import time
 from typing import Optional, Dict, Any, List
-
-import communicator
 
 
 class MMWaveSensor:
     """
-    mmWave Radar Sensor Interface.
-    Passively reads target detection data without sending commands.
+    mmWave Radar Sensor Profile.
+    Only handles response decoding.
     """
-
-    def __init__(self, dev_eui: str, token=None):
-        """
-        Initialize the sensor with device EUI.
-
-        Args:
-            dev_eui: Device EUI identifier for the LoRa sensor
-            token: Optional JWT token
-        """
-        self.dev_eui = dev_eui
-        self._token = token
-
-    def _ensure_token(self):
-        """Ensure we have a valid authentication token."""
-        if self._token is None:
-            self._token = communicator.get_token()
-        return self._token
 
     def parse_mmwave_data(self, data) -> Optional[Dict[str, List[float]]]:
         """
@@ -113,61 +93,6 @@ class MMWaveSensor:
 
         return targets if targets else None
 
-    def read_data(
-            self,
-            max_attempts: int = 1,
-            poll_interval: int = 5
-    ) -> Optional[Dict[str, List[float]]]:
-        """
-        Read mmWave radar data from the device.
-        Note: mmWave sensor does not require sending commands,
-        it continuously broadcasts target data.
-
-        Args:
-            max_attempts: Maximum number of polling attempts (default: 1)
-            poll_interval: Seconds to wait between polling attempts (default: 5)
-
-        Returns:
-            dict: Parsed target data {"target1": [angle, distance], ...}
-                  Or None if reading fails
-        """
-        try:
-            token = self._ensure_token()
-
-            # mmWave sensor does not need command sending
-            # Just pull the latest uplink data
-            for attempt in range(1, max_attempts + 1):
-                if attempt > 1:
-                    time.sleep(poll_interval)
-
-                status, hex_data = communicator.pull_latest_data(
-                    device_id=self.dev_eui,
-                    auth_token=token,
-                    size=10
-                )
-
-                if status == 1 and hex_data:
-                    parsed_data = self.parse_mmwave_data(hex_data)
-                    return parsed_data
-
-            print(f"No data received from device {self.dev_eui}")
-            return None
-
-        except Exception as e:
-            print(f"Error reading mmWave data: {e}")
-            return None
-
-
-if __name__ == "__main__":
-    DEV_EUI = "8695311001412450"
-
-    sensor = MMWaveSensor(dev_eui=DEV_EUI)
-    data = sensor.read_data()
-
-    if data:
-        print(f"Detected {len(data)} targets:")
-        for target_name, target_data in data.items():
-            angle, distance = target_data
-            print(f"  {target_name}: {angle:.1f}° @ {distance:.2f}m")
-    else:
-        print("No targets detected")
+    def decode_targets(self, data) -> Optional[Dict[str, List[float]]]:
+        """Decode response bytes/hex into target list."""
+        return self.parse_mmwave_data(data)
