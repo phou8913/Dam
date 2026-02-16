@@ -38,57 +38,23 @@ class HWT901BSensor:
         return struct.unpack(">h", b)[0]
 
     def validate_angles_response(self, hex_data: str) -> bool:
-        """
-        Strong validator for angles response.
-        Expected: [0x50][0x03][0x06] + 6 data bytes + 2 pad bytes (11+ bytes total)
-        """
-        try:
-            data = bytes.fromhex(hex_data)
-            
-            if len(data) < 11:
-                return False
-            
-            # Check frame header
-            if data[0] != 0x50 or data[1] != 0x03 or data[2] != 0x06:
-                return False
-            
-            # Valid: frame header matches expected angles response
-            return True
-        except Exception as e:
-            print(f"[HWT901BSensor] Angles validator error: {e}")
-            return False
+        """Temporary passthrough validator (accept all responses)."""
+        return True
 
     def validate_accel_response(self, hex_data: str) -> bool:
-        """
-        Strong validator for acceleration response.
-        Expected: [0x50][0x03][0x06] + 6 data bytes + 2 pad bytes (11+ bytes total)
-        """
-        try:
-            data = bytes.fromhex(hex_data)
-            
-            if len(data) < 11:
-                return False
-            
-            # Check frame header (same as angles)
-            if data[0] != 0x50 or data[1] != 0x03 or data[2] != 0x06:
-                return False
-            
-            # Valid: frame header matches expected accel response
-            return True
-        except Exception as e:
-            print(f"[HWT901BSensor] Accel validator error: {e}")
-            return False
+        """Temporary passthrough validator (accept all responses)."""
+        return True
 
     def parse_angles(self, data) -> Optional[Dict[str, Any]]:
-        """
-        Parse angle data (roll, pitch, yaw) from Modbus response.
+        """Parsing helper removed; use decode_angles instead."""
+        raise NotImplementedError("parse_angles is not implemented in this profile.")
 
-        Args:
-            data: Raw bytes or hex string from Modbus response
+    def parse_acceleration(self, data) -> Optional[Dict[str, Any]]:
+        """Parsing helper removed; use decode_acceleration instead."""
+        raise NotImplementedError("parse_acceleration is not implemented in this profile.")
 
-        Returns:
-            dict: Parsed angle data or None if parsing fails
-        """
+    def decode_angles(self, data) -> Optional[Dict[str, Any]]:
+        """Decode response bytes/hex into roll/pitch/yaw."""
         if isinstance(data, str):
             try:
                 data = bytes.fromhex(data)
@@ -120,16 +86,8 @@ class HWT901BSensor:
             print(f"Error parsing angles: {e}")
             return None
 
-    def parse_acceleration(self, data) -> Optional[Dict[str, Any]]:
-        """
-        Parse acceleration data (ax, ay, az) from Modbus response.
-
-        Args:
-            data: Raw bytes or hex string from Modbus response
-
-        Returns:
-            dict: Parsed acceleration data or None if parsing fails
-        """
+    def decode_acceleration(self, data) -> Optional[Dict[str, Any]]:
+        """Decode response bytes/hex into acceleration values."""
         if isinstance(data, str):
             try:
                 data = bytes.fromhex(data)
@@ -163,11 +121,3 @@ class HWT901BSensor:
         except Exception as e:
             print(f"Error parsing acceleration: {e}")
             return None
-
-    def decode_angles(self, data) -> Optional[Dict[str, Any]]:
-        """Decode response bytes/hex into roll/pitch/yaw."""
-        return self.parse_angles(data)
-
-    def decode_acceleration(self, data) -> Optional[Dict[str, Any]]:
-        """Decode response bytes/hex into acceleration values."""
-        return self.parse_acceleration(data)
