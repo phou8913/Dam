@@ -1,80 +1,95 @@
-# Message Flow & Function Separation
+# Architecture Design
 
 ## 1. Overall Message Flow
 
 ```
+GUI (gui.py)
+ └─ User clicks "Read Once" or auto polling
+    ↓
+Sensor Service (sensor_service.py)
+ ├─ Create Event (completion signal)
+ ├─ Put request into queue
+ └─ Return Event to GUI
+    ↓
+Communicator Worker Thread (communicator.py)
+ ├─ Take request from queue
+ ├─ Call execute_read_*() from service
+    ↓
+Sensor Profile (e.g., humidity_temp_sensor.py)
+ ├─ Generate command bytes (hex)
+ └─ Provide response validator
+    ↓
+Communicator (communicator.py)
+ ├─ Send downlink (rate-limited per DTU)
+ ├─ Poll uplinks
+ ├─ Match response using validator
+ └─ Return raw response
+    ↓
+Sensor Profile
+ └─ Decode response → structured data (dict)
+    ↓
+Communicator Worker
+ ├─ Store result in buffer
+ └─ Set Event (signal completion)
+    ↓
 GUI
- └─(user action / auto polling)
-    └─ Sensor Profile
-       ├─ generate command bytes (hex)
-       └─ response validator
-            ↓
-        Communicator
-        ├─ send downlink (rate-limited, per-DTU)
-        ├─ poll uplinks
-        ├─ match response using validator
-        └─ timeout handling
-            ↓
-       Sensor Profile
-       └─ decode response bytes → structured data
-            ↓
-GUI
- └─ update UI / visualization
+ ├─ Event.wait() unblocks
+ ├─ Read fresh data from buffer
+ └─ Update UI
 ```
 
-Key points
-
-- GUI never handles raw bytes or protocol details.
-- Sensor profile never does networking or message scheduling.
-- Communicator is the only place that knows how messages are sent, received, queued, and matched.
+**Key Flow**: Request → Queue → Worker → Execute → Buffer → Display
 
 ## 2. Function Separation
 
 ### GUI (gui.py)
+**Responsibilities**:
+- User interaction (buttons, auto polling)
+- Call sensor_service to request data
+- Wait for Event completion
+- Read buffer and update UI
 
-Responsibilities
+**Does NOT**:
+- Handle protocols or raw bytes
+- Directly call communicator or profiles
 
-- User interaction (manual / auto read)
-- UI update and visualization
+---
 
-### Sensor Profiles
+### Sensor Service (sensor_service.py)
+**Responsibilities**:
+- Create Event for each request
+- Put requests into queue
+- Execute sensor reading workflows (multi-step logic)
+- Coordinate between profiles and communicator
 
-(humidity_temp_sensor.py, tilt_acc_sensor.py, water_level_sensor.py, mmwave_sensor.py)
+**Functions**:
+- `request_read_*()` - Queue request, return Event
+- `execute_read_*()` - Full read workflow (call profile + communicator)
 
-Responsibilities
-
-- Generate command bytes (hex)
-- Validate whether a response belongs to a request
-- Decode response bytes into structured data (dict)
-
-Does NOT
-
-- Send requests
-- Poll uplinks
-- Manage queues, timing, or retries
+---
 
 ### Communicator (communicator.py)
+**Responsibilities**:
+- Queue management (request_queue)
+- Buffer storage (device + sensor → result)
+- Worker thread (process queue asynchronously)
+- HTTP communication with LoRa gateway
+- Rate limiting (1 sec per DTU)
 
-Responsibilities
+**Does NOT**:
+- Understand sensor protocols
+- Decode response bytes
 
-- Unified communication layer for both real and fake DTU
-- Per-DTU rate limiting (queue + minimum interval)
-- Serialized send-and-wait per device (inflight lock)
-- Poll uplinks and evaluate responses using validators
-- Timeout and old-packet protection
+---
 
-Does NOT
+### Sensor Profiles
+(humidity_temp_sensor.py, tilt_acc_sensor.py, water_level_sensor.py, mmwave_sensor.py)
 
-- Decode sensor-specific data
+**Responsibilities**:
+- Generate command bytes (hex)
+- Validate response (check if it matches request)
+- Decode response bytes → dict
 
-### Backend Selection (config.py, launch scripts)
-
-Responsibilities
-
-- Select real vs fake gateway only by URL
-- No logic differences between fake and real DTU
-
-Mechanism
-
-- USE_FAKE_SERVER environment variable
-- Different launcher scripts (run_with_fake_server.py, run_with_real_server.py)
+**Does NOT**:
+- Send network requests
+- Manage queues or timing

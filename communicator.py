@@ -131,6 +131,93 @@ class _Backend:
 _backend = _Backend()
 
 
+# ==================== Request Queue and Buffer ====================
+# Request queue for sensor read tasks
+request_queue = queue.Queue()
+
+# Buffer to store latest results per device
+# Structure: {dev_eui: {sensor_type: {"ok": bool, "data": {...}, "error": str, "timestamp": float}}}
+buffer = {}
+buffer_lock = threading.Lock()
+
+
+def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
+    """
+    Safely get latest buffer data for a device and sensor.
+    
+    Args:
+        dev_eui: Device EUI
+        sensor: Sensor type ("ht", "ta", "wl", "mmwave")
+    
+    Returns:
+        dict: {"ok": bool, "data": {...}, "error": str, "timestamp": float} or None
+    """
+    with buffer_lock:
+        if dev_eui in buffer and sensor in buffer[dev_eui]:
+            return buffer[dev_eui][sensor]
+    return None
+
+
+def _buffer_worker():
+    """
+    Background worker thread that processes sensor read requests from the queue,
+    executes them, and updates the buffer.
+    """
+    # Import here to avoid circular dependency
+    import sensor_service as ss
+    
+    while True:
+        try:
+            # Block until a request is available
+            task = request_queue.get(timeout=1.0)
+            
+            if task is None:  # Poison pill to stop worker
+                break
+            
+            dev_eui = task.get("dev_eui")
+            sensor = task.get("sensor")
+            completion_event = task.get("completion_event")
+            
+            if not dev_eui or not sensor:
+                print("[_buffer_worker] Invalid task, skipping")
+                if completion_event:
+                    completion_event.set()
+                continue
+            
+            # Execute the read based on sensor type
+            result = None
+            try:
+                if sensor == "ht":
+                    result = ss.execute_read_ht(dev_eui)
+                elif sensor == "ta":
+                    result = ss.execute_read_ta(dev_eui)
+                elif sensor == "wl":
+                    result = ss.execute_read_wl(dev_eui)
+                elif sensor == "mmwave":
+                    result = ss.execute_read_mmwave(dev_eui)
+                else:
+                    result = {"ok": False, "data": None, "error": f"Unknown sensor: {sensor}", "timestamp": time.time()}
+            except Exception as e:
+                result = {"ok": False, "data": None, "error": f"Worker exception: {str(e)}", "timestamp": time.time()}
+            
+            # Update buffer with result
+            if result:
+                with buffer_lock:
+                    if dev_eui not in buffer:
+                        buffer[dev_eui] = {}
+                    buffer[dev_eui][sensor] = result
+                    print(f"[_buffer_worker] Updated buffer: {dev_eui}/{sensor} ok={result['ok']}")
+            
+            # Signal completion to waiting GUI thread
+            if completion_event:
+                completion_event.set()
+        
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[_buffer_worker] Unexpected error: {e}")
+
+
 # ==================== Per-DTU Rate Limiter ====================
 class DTUQueue:
     """
@@ -398,3 +485,20 @@ def send_and_wait(
         return (0, None)
 
 
+# ==================== Initialize and Start Buffer Worker ====================
+
+def _initialize_service():
+    """Initialize sensor_service with references to queue and communicator."""
+    try:
+        import sensor_service as ss
+        ss.init(request_queue, __import__(__name__))
+    except ImportError:
+        print("[initialize_service] sensor_service not yet available, will retry later")
+
+
+# Start the buffer worker thread as a daemon
+_worker_thread = threading.Thread(target=_buffer_worker, daemon=True)
+_worker_thread.start()
+
+# Initialize sensor service
+_initialize_service()

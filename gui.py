@@ -17,11 +17,9 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 
-from humidity_temp_sensor import HumidityTempSensor
-from tilt_acc_sensor import HWT901BSensor
-from water_level_sensor import WaterLevelSensor
-from mmwave_sensor import MMWaveSensor
 import communicator
+import sensor_service
+
 
 
 # Global Device EUI Defaults
@@ -405,34 +403,35 @@ class SensorDashboard:
         dev_eui = self.ht_eui_entry.get().strip()
         self.log_terminal("\n--- Humidity/Temperature Sensor ---")
         try:
-            profile = HumidityTempSensor()
-            token = communicator.get_token()
-            cmd_hex = profile.encode_read_command()
-
-            status, hex_data = communicator.send_and_wait(
-                device_id=dev_eui,
-                data_to_send=cmd_hex,
-                auth_token=token,
-                response_validator=profile.validate_response,
-                timeout_sec=15.0,
-                fport=1,
-                reference="humidity-read",
-                min_interval_sec=1.0,
-                poll_interval_sec=1.0
-            )
-
-            data = profile.decode_response(hex_data) if status == 1 and hex_data else None
-
-            if data:
+            # Request the read and get completion event
+            completion_event = sensor_service.request_read_ht(dev_eui)
+            self.log_terminal("Read request queued, waiting for response...")
+            
+            # Wait for the request to complete (max 20 seconds)
+            completed = completion_event.wait(timeout=20.0)
+            
+            if not completed:
+                self.log_terminal("Timeout: no response after 20 seconds")
+                return
+            
+            # Get the latest data from buffer (should be fresh now)
+            result = communicator.get_buffer_data(dev_eui, "ht")
+            
+            if result and result.get("ok"):
+                data = result.get("data")
                 self.log_terminal(f"Temperature: {data['temperature_c']:.2f} °C")
                 self.log_terminal(f"Humidity: {data['humidity_rh']:.2f} %RH")
                 self.log_terminal(f"Dewpoint: {data['dewpoint_c']:.2f} °C")
                 self.log_terminal(f"CRC Valid: {data['crc_valid']}")
                 self.log_terminal(f"Raw: {data['raw_hex']}")
-
+                self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
+                
                 self.root.after(0, lambda: self.update_ht_display(data))
+            elif result and not result.get("ok"):
+                error_msg = result.get("error", "Unknown error")
+                self.log_terminal(f"Failed to read: {error_msg}")
             else:
-                self.log_terminal("Failed to read data")
+                self.log_terminal("No data available")
         except Exception as e:
             self.log_terminal(f"Error: {e}")
 
@@ -440,64 +439,37 @@ class SensorDashboard:
         dev_eui = self.ta_eui_entry.get().strip()
         self.log_terminal("\n--- Tilt/Acceleration Sensor ---")
         try:
-            profile = HWT901BSensor()
-            token = communicator.get_token()
-
-            # Read angles
-            unlock_cmd = profile.encode_unlock_command()
-            status, _ = communicator.send_request(
-                device_id=dev_eui,
-                data_to_send=unlock_cmd,
-                auth_token=token,
-                min_interval_sec=1.0
-            )
-            if status != 1:
-                self.log_terminal("Failed to send unlock command")
+            # Request the read and get completion event
+            completion_event = sensor_service.request_read_ta(dev_eui)
+            self.log_terminal("Read request queued, waiting for response...")
+            
+            # Wait for the request to complete (max 20 seconds)
+            completed = completion_event.wait(timeout=20.0)
+            
+            if not completed:
+                self.log_terminal("Timeout: no response after 20 seconds")
                 return
-            time.sleep(0.5)
-
-            angles_status, angles_hex = communicator.send_and_wait(
-                device_id=dev_eui,
-                data_to_send=profile.encode_read_angles_command(),
-                auth_token=token,
-                response_validator=profile.validate_angles_response,
-                timeout_sec=15.0,
-                fport=1,
-                reference="angles-read",
-                min_interval_sec=1.0,
-                poll_interval_sec=1.0
-            )
-            angles = profile.decode_angles(angles_hex) if angles_status == 1 and angles_hex else None
-            if angles:
-                self.log_terminal(f"Roll: {angles['roll']:.2f}°")
-                self.log_terminal(f"Pitch: {angles['pitch']:.2f}°")
-                self.log_terminal(f"Yaw: {angles['yaw']:.2f}°")
-
-                # Read acceleration
-                accel_status, accel_hex = communicator.send_and_wait(
-                    device_id=dev_eui,
-                    data_to_send=profile.encode_read_accel_command(),
-                    auth_token=token,
-                    response_validator=profile.validate_accel_response,
-                    timeout_sec=15.0,
-                    fport=1,
-                    reference="accel-read",
-                    min_interval_sec=1.0,
-                    poll_interval_sec=1.0
-                )
-                accel = profile.decode_acceleration(accel_hex) if accel_status == 1 and accel_hex else None
-                if accel:
-                    self.log_terminal(f"Ax: {accel['ax_g']:.3f}g ({accel['ax_ms2']:.2f} m/s²)")
-                    self.log_terminal(f"Ay: {accel['ay_g']:.3f}g ({accel['ay_ms2']:.2f} m/s²)")
-                    self.log_terminal(f"Az: {accel['az_g']:.3f}g ({accel['az_ms2']:.2f} m/s²)")
-                    self.log_terminal(f"Raw: {accel['raw_hex']}")
-
-                    combined_data = {**angles, **accel}
-                    self.root.after(0, lambda: self.update_ta_display(combined_data))
-                else:
-                    self.log_terminal("Failed to read acceleration")
+            
+            # Get the latest data from buffer (should be fresh now)
+            result = communicator.get_buffer_data(dev_eui, "ta")
+            
+            if result and result.get("ok"):
+                data = result.get("data")
+                self.log_terminal(f"Roll: {data['roll']:.2f}°")
+                self.log_terminal(f"Pitch: {data['pitch']:.2f}°")
+                self.log_terminal(f"Yaw: {data['yaw']:.2f}°")
+                self.log_terminal(f"Ax: {data['ax_g']:.3f}g ({data['ax_ms2']:.2f} m/s²)")
+                self.log_terminal(f"Ay: {data['ay_g']:.3f}g ({data['ay_ms2']:.2f} m/s²)")
+                self.log_terminal(f"Az: {data['az_g']:.3f}g ({data['az_ms2']:.2f} m/s²)")
+                self.log_terminal(f"Raw: {data['raw_hex']}")
+                self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
+                
+                self.root.after(0, lambda: self.update_ta_display(data))
+            elif result and not result.get("ok"):
+                error_msg = result.get("error", "Unknown error")
+                self.log_terminal(f"Failed to read: {error_msg}")
             else:
-                self.log_terminal("Failed to read angles")
+                self.log_terminal("No data available")
         except Exception as e:
             self.log_terminal(f"Error: {e}")
 
@@ -505,32 +477,33 @@ class SensorDashboard:
         dev_eui = self.wl_eui_entry.get().strip()
         self.log_terminal("\n--- Water Level Sensor ---")
         try:
-            profile = WaterLevelSensor()
-            token = communicator.get_token()
-            cmd_hex = profile.encode_read_command()
-
-            status, hex_data = communicator.send_and_wait(
-                device_id=dev_eui,
-                data_to_send=cmd_hex,
-                auth_token=token,
-                response_validator=profile.validate_response,
-                timeout_sec=15.0,
-                fport=1,
-                reference="water-level-read",
-                min_interval_sec=1.0,
-                poll_interval_sec=1.0
-            )
-
-            data = profile.decode_response(hex_data) if status == 1 and hex_data else None
-
-            if data:
+            # Request the read and get completion event
+            completion_event = sensor_service.request_read_wl(dev_eui)
+            self.log_terminal("Read request queued, waiting for response...")
+            
+            # Wait for the request to complete (max 20 seconds)
+            completed = completion_event.wait(timeout=20.0)
+            
+            if not completed:
+                self.log_terminal("Timeout: no response after 20 seconds")
+                return
+            
+            # Get the latest data from buffer (should be fresh now)
+            result = communicator.get_buffer_data(dev_eui, "wl")
+            
+            if result and result.get("ok"):
+                data = result.get("data")
                 self.log_terminal(f"Water Level: {data['level_m']:.3f} m")
                 self.log_terminal(f"CRC Valid: {data['crc_valid']}")
                 self.log_terminal(f"Raw: {data['raw_hex']}")
-
+                self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
+                
                 self.root.after(0, lambda: self.update_wl_display(data))
+            elif result and not result.get("ok"):
+                error_msg = result.get("error", "Unknown error")
+                self.log_terminal(f"Failed to read: {error_msg}")
             else:
-                self.log_terminal("Failed to read data")
+                self.log_terminal("No data available")
         except Exception as e:
             self.log_terminal(f"Error: {e}")
 
@@ -538,27 +511,45 @@ class SensorDashboard:
         dev_eui = self.mmwave_eui_entry.get().strip()
         self.log_terminal("\n--- mmWave Radar Sensor ---")
         try:
-            profile = MMWaveSensor()
-            token = communicator.get_token()
-            status, hex_data = communicator.pull_latest_data(
-                device_id=dev_eui,
-                auth_token=token,
-                size=10
-            )
-            targets = profile.decode_targets(hex_data) if status == 1 and hex_data else None
+            # Request the read and get completion event
+            completion_event = sensor_service.request_read_mmwave(dev_eui)
+            self.log_terminal("Read request queued, waiting for response...")
+            
+            # Wait for the request to complete (max 20 seconds)
+            completed = completion_event.wait(timeout=20.0)
+            
+            if not completed:
+                self.log_terminal("Timeout: no response after 20 seconds")
+                self.root.after(0, lambda: self.update_radar_plot({}))
+                self.root.after(0, lambda: self.update_target_display({}))
+                return
+            
+            # Get the latest data from buffer (should be fresh now)
+            result = communicator.get_buffer_data(dev_eui, "mmwave")
+            
+            if result and result.get("ok"):
+                targets_dict = result.get("data", {}).get("targets", {})
+                if targets_dict:
+                    self.mmwave_targets = targets_dict
+                    self.log_terminal(f"Detected {len(targets_dict)} targets:")
+                    for name, data in targets_dict.items():
+                        angle, distance = data
+                        self.log_terminal(f"  {name}: {angle:.1f}° @ {distance:.2f}m")
+                    self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
 
-            if targets:
-                self.mmwave_targets = targets
-                self.log_terminal(f"Detected {len(targets)} targets:")
-                for name, data in targets.items():
-                    angle, distance = data
-                    self.log_terminal(f"  {name}: {angle:.1f}° @ {distance:.2f}m")
-
-                self.root.after(0, lambda: self.update_radar_plot(targets))
-                self.root.after(0, lambda: self.update_target_display(targets))
+                    self.root.after(0, lambda: self.update_radar_plot(targets_dict))
+                    self.root.after(0, lambda: self.update_target_display(targets_dict))
+                else:
+                    self.log_terminal("No targets detected")
+                    self.root.after(0, lambda: self.update_radar_plot({}))
+                    self.root.after(0, lambda: self.update_target_display({}))
+            elif result and not result.get("ok"):
+                error_msg = result.get("error", "Unknown error")
+                self.log_terminal(f"Failed to read: {error_msg}")
+                self.root.after(0, lambda: self.update_radar_plot({}))
+                self.root.after(0, lambda: self.update_target_display({}))
             else:
-                self.log_terminal("No targets detected")
-                # Clear the display
+                self.log_terminal("No data available")
                 self.root.after(0, lambda: self.update_radar_plot({}))
                 self.root.after(0, lambda: self.update_target_display({}))
         except Exception as e:
