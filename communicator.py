@@ -190,19 +190,10 @@ def _buffer_worker():
                     completion_event.set()
                 continue
             
-            # Execute the read based on sensor type
+            # Execute queued sensor task through unified bundled dispatcher
             result = None
             try:
-                if sensor == "ht":
-                    result = ss.execute_read_ht(dev_eui)
-                elif sensor == "ta":
-                    result = ss.execute_read_ta(dev_eui)
-                elif sensor == "wl":
-                    result = ss.execute_read_wl(dev_eui)
-                elif sensor == "mmwave":
-                    result = ss.execute_read_mmwave(dev_eui)
-                else:
-                    result = {"ok": False, "data": None, "error": f"Unknown sensor: {sensor}", "timestamp": time.time()}
+                result = ss.execute_bundled_read(task)
             except Exception as e:
                 result = {"ok": False, "data": None, "error": f"Worker exception: {str(e)}", "timestamp": time.time()}
             
@@ -288,7 +279,10 @@ class DTUQueue:
         if completion_event.wait(timeout):
             if result_holder["error"]:
                 return (0, None)
-            return result_holder["result"]
+            result = result_holder["result"]
+            if result is None:
+                return (0, None)
+            return result
         else:
             return (0, None)
 
