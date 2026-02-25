@@ -18,14 +18,20 @@ from collections import defaultdict
 
 # ==================== Import Configuration ====================
 import requests
-import config
+
+USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
+
+if USE_FAKE_SERVER:
+    DEFAULT_BASE_URL = "http://localhost:5000/api"
+else:
+    DEFAULT_BASE_URL = "http://99.10.226.29:4560/api"
 
 class _Backend:
     """Unified LoRa API communicator (works with real or fake HTTP server)"""
-    
-    BASE_URL = config.BASE_URL
-    ACCOUNT = config.ACCOUNT
-    PASSWORD = config.PASSWORD
+
+    BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
+    ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
+    PASSWORD = os.getenv("LORA_PASSWORD", "admin")
 
     @staticmethod
     def get_token() -> str:

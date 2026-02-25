@@ -5,11 +5,13 @@ Each section has auto/manual control with separate Device EUIs
 
 import tkinter as tk
 from tkinter import ttk
+import argparse
+import os
 import threading
 import time
-import random
 import math
-from datetime import datetime
+from typing import Callable
+from functools import partial
 
 import matplotlib
 matplotlib.use('TkAgg')
@@ -17,7 +19,6 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import numpy as np
 
-import communicator
 import sensor_service
 
 
@@ -300,11 +301,6 @@ class SensorDashboard:
             else:
                 label.config(text=f"Target {i+1}: --", foreground="gray")
 
-    def log_terminal(self, message):
-        """Print to terminal with timestamp."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] {message}")
-
     # ===== Auto/Manual Toggle Functions =====
 
     def toggle_ht_auto(self):
@@ -312,55 +308,56 @@ class SensorDashboard:
         if self.ht_auto:
             self.ht_auto_btn.config(text="Stop Auto")
             self.ht_status.config(text="Auto Running", foreground="green")
-            self.log_terminal("Humidity/Temp: Auto mode STARTED")
         else:
             self.ht_auto_btn.config(text="Start Auto")
             self.ht_status.config(text="Manual", foreground="gray")
-            self.log_terminal("Humidity/Temp: Auto mode STOPPED")
 
     def toggle_ta_auto(self):
         self.ta_auto = not self.ta_auto
         if self.ta_auto:
             self.ta_auto_btn.config(text="Stop Auto")
             self.ta_status.config(text="Auto Running", foreground="green")
-            self.log_terminal("Tilt/Acc: Auto mode STARTED")
         else:
             self.ta_auto_btn.config(text="Start Auto")
             self.ta_status.config(text="Manual", foreground="gray")
-            self.log_terminal("Tilt/Acc: Auto mode STOPPED")
 
     def toggle_wl_auto(self):
         self.wl_auto = not self.wl_auto
         if self.wl_auto:
             self.wl_auto_btn.config(text="Stop Auto")
             self.wl_status.config(text="Auto Running", foreground="green")
-            self.log_terminal("Water Level: Auto mode STARTED")
         else:
             self.wl_auto_btn.config(text="Start Auto")
             self.wl_status.config(text="Manual", foreground="gray")
-            self.log_terminal("Water Level: Auto mode STOPPED")
 
     def toggle_mmwave_auto(self):
         self.mmwave_auto = not self.mmwave_auto
         if self.mmwave_auto:
             self.mmwave_auto_btn.config(text="Stop Auto")
             self.mmwave_status.config(text="Auto Running", foreground="green")
-            self.log_terminal("mmWave Radar: Auto mode STARTED")
         else:
             self.mmwave_auto_btn.config(text="Start Auto")
             self.mmwave_status.config(text="Manual", foreground="gray")
-            self.log_terminal("mmWave Radar: Auto mode STOPPED")
 
     # ===== Manual Read Functions =====
 
     def manual_read_ht(self):
-        threading.Thread(target=self._read_ht_once, daemon=True).start()
+        threading.Thread(
+            target=partial(self._read_and_update_once, self.ht_eui_entry, sensor_service.read_ht, self.update_ht_display),
+            daemon=True
+        ).start()
 
     def manual_read_ta(self):
-        threading.Thread(target=self._read_ta_once, daemon=True).start()
+        threading.Thread(
+            target=partial(self._read_and_update_once, self.ta_eui_entry, sensor_service.read_ta, self.update_ta_display),
+            daemon=True
+        ).start()
 
     def manual_read_wl(self):
-        threading.Thread(target=self._read_wl_once, daemon=True).start()
+        threading.Thread(
+            target=partial(self._read_and_update_once, self.wl_eui_entry, sensor_service.read_wl, self.update_wl_display),
+            daemon=True
+        ).start()
 
     def manual_read_mmwave(self):
         threading.Thread(target=self._read_mmwave_once, daemon=True).start()
@@ -368,27 +365,36 @@ class SensorDashboard:
     # ===== Auto Polling Threads =====
 
     def start_all_polling_threads(self):
-        threading.Thread(target=self.ht_polling_loop, daemon=True).start()
-        threading.Thread(target=self.ta_polling_loop, daemon=True).start()
-        threading.Thread(target=self.wl_polling_loop, daemon=True).start()
+        threading.Thread(
+            target=partial(
+                self._polling_loop,
+                lambda: self.ht_auto,
+                partial(self._read_and_update_once, self.ht_eui_entry, sensor_service.read_ht, self.update_ht_display)
+            ),
+            daemon=True
+        ).start()
+        threading.Thread(
+            target=partial(
+                self._polling_loop,
+                lambda: self.ta_auto,
+                partial(self._read_and_update_once, self.ta_eui_entry, sensor_service.read_ta, self.update_ta_display)
+            ),
+            daemon=True
+        ).start()
+        threading.Thread(
+            target=partial(
+                self._polling_loop,
+                lambda: self.wl_auto,
+                partial(self._read_and_update_once, self.wl_eui_entry, sensor_service.read_wl, self.update_wl_display)
+            ),
+            daemon=True
+        ).start()
         threading.Thread(target=self.mmwave_polling_loop, daemon=True).start()
 
-    def ht_polling_loop(self):
+    def _polling_loop(self, is_auto_enabled: Callable[[], bool], read_action: Callable[[], None]):
         while True:
-            if self.ht_auto:
-                self._read_ht_once()
-            time.sleep(self.poll_interval)
-
-    def ta_polling_loop(self):
-        while True:
-            if self.ta_auto:
-                self._read_ta_once()
-            time.sleep(self.poll_interval)
-
-    def wl_polling_loop(self):
-        while True:
-            if self.wl_auto:
-                self._read_wl_once()
+            if is_auto_enabled():
+                read_action()
             time.sleep(self.poll_interval)
 
     def mmwave_polling_loop(self):
@@ -399,161 +405,39 @@ class SensorDashboard:
 
     # ===== Actual Read Functions =====
 
-    def _read_ht_once(self):
-        dev_eui = self.ht_eui_entry.get().strip()
-        self.log_terminal("\n--- Humidity/Temperature Sensor ---")
+    def _read_and_update_once(self, eui_entry, read_func: Callable, update_func: Callable):
+        dev_eui = eui_entry.get().strip()
         try:
-            # Request the read and get completion event
-            completion_event = sensor_service.request_read_ht(dev_eui)
-            self.log_terminal("Read request queued, waiting for response...")
-            
-            # Wait for the request to complete (max 20 seconds)
-            completed = completion_event.wait(timeout=20.0)
-            
-            if not completed:
-                self.log_terminal("Timeout: no response after 20 seconds")
-                return
-            
-            # Get the latest data from buffer (should be fresh now)
-            result = communicator.get_buffer_data(dev_eui, "ht")
-            
-            if result and result.get("ok"):
-                data = result.get("data")
-                self.log_terminal(f"Temperature: {data['temperature_c']:.2f} °C")
-                self.log_terminal(f"Humidity: {data['humidity_rh']:.2f} %RH")
-                self.log_terminal(f"Dewpoint: {data['dewpoint_c']:.2f} °C")
-                self.log_terminal(f"CRC Valid: {data['crc_valid']}")
-                self.log_terminal(f"Raw: {data['raw_hex']}")
-                self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
-                
-                self.root.after(0, lambda: self.update_ht_display(data))
-            elif result and not result.get("ok"):
-                error_msg = result.get("error", "Unknown error")
-                self.log_terminal(f"Failed to read: {error_msg}")
-            else:
-                self.log_terminal("No data available")
-        except Exception as e:
-            self.log_terminal(f"Error: {e}")
+            result = read_func(dev_eui, timeout=20.0)
 
-    def _read_ta_once(self):
-        dev_eui = self.ta_eui_entry.get().strip()
-        self.log_terminal("\n--- Tilt/Acceleration Sensor ---")
-        try:
-            # Request the read and get completion event
-            completion_event = sensor_service.request_read_ta(dev_eui)
-            self.log_terminal("Read request queued, waiting for response...")
-            
-            # Wait for the request to complete (max 20 seconds)
-            completed = completion_event.wait(timeout=20.0)
-            
-            if not completed:
-                self.log_terminal("Timeout: no response after 20 seconds")
+            if not result or not result.get("ok"):
                 return
-            
-            # Get the latest data from buffer (should be fresh now)
-            result = communicator.get_buffer_data(dev_eui, "ta")
-            
-            if result and result.get("ok"):
-                data = result.get("data")
-                self.log_terminal(f"Roll: {data['roll']:.2f}°")
-                self.log_terminal(f"Pitch: {data['pitch']:.2f}°")
-                self.log_terminal(f"Yaw: {data['yaw']:.2f}°")
-                self.log_terminal(f"Ax: {data['ax_g']:.3f}g ({data['ax_ms2']:.2f} m/s²)")
-                self.log_terminal(f"Ay: {data['ay_g']:.3f}g ({data['ay_ms2']:.2f} m/s²)")
-                self.log_terminal(f"Az: {data['az_g']:.3f}g ({data['az_ms2']:.2f} m/s²)")
-                self.log_terminal(f"Raw: {data['raw_hex']}")
-                self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
-                
-                self.root.after(0, lambda: self.update_ta_display(data))
-            elif result and not result.get("ok"):
-                error_msg = result.get("error", "Unknown error")
-                self.log_terminal(f"Failed to read: {error_msg}")
-            else:
-                self.log_terminal("No data available")
-        except Exception as e:
-            self.log_terminal(f"Error: {e}")
 
-    def _read_wl_once(self):
-        dev_eui = self.wl_eui_entry.get().strip()
-        self.log_terminal("\n--- Water Level Sensor ---")
-        try:
-            # Request the read and get completion event
-            completion_event = sensor_service.request_read_wl(dev_eui)
-            self.log_terminal("Read request queued, waiting for response...")
-            
-            # Wait for the request to complete (max 20 seconds)
-            completed = completion_event.wait(timeout=20.0)
-            
-            if not completed:
-                self.log_terminal("Timeout: no response after 20 seconds")
-                return
-            
-            # Get the latest data from buffer (should be fresh now)
-            result = communicator.get_buffer_data(dev_eui, "wl")
-            
-            if result and result.get("ok"):
-                data = result.get("data")
-                self.log_terminal(f"Water Level: {data['level_m']:.3f} m")
-                self.log_terminal(f"CRC Valid: {data['crc_valid']}")
-                self.log_terminal(f"Raw: {data['raw_hex']}")
-                self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
-                
-                self.root.after(0, lambda: self.update_wl_display(data))
-            elif result and not result.get("ok"):
-                error_msg = result.get("error", "Unknown error")
-                self.log_terminal(f"Failed to read: {error_msg}")
-            else:
-                self.log_terminal("No data available")
-        except Exception as e:
-            self.log_terminal(f"Error: {e}")
+            data = result.get("data")
+            self.root.after(0, lambda: update_func(data))
+        except Exception:
+            return
 
     def _read_mmwave_once(self):
         dev_eui = self.mmwave_eui_entry.get().strip()
-        self.log_terminal("\n--- mmWave Radar Sensor ---")
         try:
-            # Request the read and get completion event
-            completion_event = sensor_service.request_read_mmwave(dev_eui)
-            self.log_terminal("Read request queued, waiting for response...")
-            
-            # Wait for the request to complete (max 20 seconds)
-            completed = completion_event.wait(timeout=20.0)
-            
-            if not completed:
-                self.log_terminal("Timeout: no response after 20 seconds")
-                self.root.after(0, lambda: self.update_radar_plot({}))
-                self.root.after(0, lambda: self.update_target_display({}))
-                return
-            
-            # Get the latest data from buffer (should be fresh now)
-            result = communicator.get_buffer_data(dev_eui, "mmwave")
-            
+            result = sensor_service.read_mmwave(dev_eui, timeout=20.0)
+
             if result and result.get("ok"):
                 targets_dict = result.get("data", {}).get("targets", {})
                 if targets_dict:
                     self.mmwave_targets = targets_dict
-                    self.log_terminal(f"Detected {len(targets_dict)} targets:")
-                    for name, data in targets_dict.items():
-                        angle, distance = data
-                        self.log_terminal(f"  {name}: {angle:.1f}° @ {distance:.2f}m")
-                    self.log_terminal(f"Updated at: {datetime.fromtimestamp(result.get('timestamp', 0)).strftime('%H:%M:%S')}")
-
                     self.root.after(0, lambda: self.update_radar_plot(targets_dict))
                     self.root.after(0, lambda: self.update_target_display(targets_dict))
                 else:
-                    self.log_terminal("No targets detected")
                     self.root.after(0, lambda: self.update_radar_plot({}))
                     self.root.after(0, lambda: self.update_target_display({}))
-            elif result and not result.get("ok"):
-                error_msg = result.get("error", "Unknown error")
-                self.log_terminal(f"Failed to read: {error_msg}")
-                self.root.after(0, lambda: self.update_radar_plot({}))
-                self.root.after(0, lambda: self.update_target_display({}))
             else:
-                self.log_terminal("No data available")
                 self.root.after(0, lambda: self.update_radar_plot({}))
                 self.root.after(0, lambda: self.update_target_display({}))
-        except Exception as e:
-            self.log_terminal(f"Error: {e}")
+        except Exception:
+            self.root.after(0, lambda: self.update_radar_plot({}))
+            self.root.after(0, lambda: self.update_target_display({}))
 
     # ===== Display Update Functions =====
 
@@ -579,11 +463,19 @@ class SensorDashboard:
         self.wl_raw.config(text=data['raw_hex'])
 
 
-def main():
+def main(mode: str = "real"):
+    if mode == "fake":
+        os.environ["USE_FAKE_SERVER"] = "1"
+    else:
+        os.environ.pop("USE_FAKE_SERVER", None)
+
     root = tk.Tk()
     app = SensorDashboard(root)
     root.mainloop()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run GUI in real or fake gateway mode")
+    parser.add_argument("--mode", choices=["real", "fake"], default="real")
+    args = parser.parse_args()
+    main(args.mode)

@@ -1,5 +1,13 @@
 # Architecture Design
 
+## 0. Launch Entry Point
+
+- Manual startup:
+    - Real server: `python gui.py --mode real`
+    - Fake server:
+        1. Terminal A: `python fake_server.py`
+        2. Terminal B: `python gui.py --mode fake`
+
 ## 1. Overall Message Flow
 
 ```
@@ -7,9 +15,9 @@ GUI (gui.py)
  └─ User clicks "Read Once" or auto polling
     ↓
 Sensor Service (sensor_service.py)
- ├─ Create Event (completion signal)
- ├─ Put request into queue
- └─ Return Event to GUI
+ ├─ `read_*()` queues request internally
+ ├─ Wait for completion Event internally
+ └─ Read latest result from communicator buffer
     ↓
 Communicator Worker Thread (communicator.py)
  ├─ Take request from queue
@@ -33,9 +41,7 @@ Communicator Worker
  └─ Set Event (signal completion)
     ↓
 GUI
- ├─ Event.wait() unblocks
- ├─ Read fresh data from buffer
- └─ Update UI
+ └─ Update UI with `read_*()` returned data
 ```
 
 **Key Flow**: Request → Queue → Worker → Execute → Buffer → Display
@@ -45,9 +51,8 @@ GUI
 ### GUI (gui.py)
 **Responsibilities**:
 - User interaction (buttons, auto polling)
-- Call sensor_service to request data
-- Wait for Event completion
-- Read buffer and update UI
+- Call sensor_service `read_*()` to get sensor results
+- Update UI with returned data
 
 **Does NOT**:
 - Handle protocols or raw bytes
@@ -59,11 +64,13 @@ GUI
 **Responsibilities**:
 - Create Event for each request
 - Put requests into queue
+- Wait for Event completion and fetch buffered result
 - Execute sensor reading workflows (multi-step logic)
 - Coordinate between profiles and communicator
 
 **Functions**:
-- `request_read_*()` - Queue request, return Event
+- `read_*()` - Queue request, wait, and return final result dict
+- `request_read_*()` - Low-level queue helper returning Event
 - `execute_read_*()` - Full read workflow (call profile + communicator)
 
 ---

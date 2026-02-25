@@ -7,9 +7,9 @@ Responsible for:
 """
 
 import time
-import queue as queue_module
 import threading
-from typing import Dict, Any, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Any, Callable
 
 # Sensor profiles
 from humidity_temp_sensor import HumidityTempSensor
@@ -22,6 +22,82 @@ _request_queue = None
 _communicator_module = None
 
 
+def _log_terminal(message: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+def _log_read_start(sensor_title: str):
+    _log_terminal(f"\n--- {sensor_title} ---")
+    _log_terminal("Read request queued, waiting for response...")
+
+
+def _log_read_result(sensor: str, result: Dict[str, Any]):
+    if not result or not result.get("ok"):
+        error_msg = (result or {}).get("error", "No data available")
+        if str(error_msg).startswith("Timeout:"):
+            _log_terminal(str(error_msg))
+        else:
+            _log_terminal(f"Failed to read: {error_msg}")
+        return
+
+    data = result.get("data") or {}
+
+    if sensor == "ht":
+        _log_terminal(f"Temperature: {data['temperature_c']:.2f} °C")
+        _log_terminal(f"Humidity: {data['humidity_rh']:.2f} %RH")
+        _log_terminal(f"Dewpoint: {data['dewpoint_c']:.2f} °C")
+        _log_terminal(f"CRC Valid: {data['crc_valid']}")
+        _log_terminal(f"Raw: {data['raw_hex']}")
+    elif sensor == "ta":
+        _log_terminal(f"Roll: {data['roll']:.2f}°")
+        _log_terminal(f"Pitch: {data['pitch']:.2f}°")
+        _log_terminal(f"Yaw: {data['yaw']:.2f}°")
+        _log_terminal(f"Ax: {data['ax_g']:.3f}g ({data['ax_ms2']:.2f} m/s²)")
+        _log_terminal(f"Ay: {data['ay_g']:.3f}g ({data['ay_ms2']:.2f} m/s²)")
+        _log_terminal(f"Az: {data['az_g']:.3f}g ({data['az_ms2']:.2f} m/s²)")
+        _log_terminal(f"Raw: {data['raw_hex']}")
+    elif sensor == "wl":
+        _log_terminal(f"Water Level: {data['level_m']:.3f} m")
+        _log_terminal(f"CRC Valid: {data['crc_valid']}")
+        _log_terminal(f"Raw: {data['raw_hex']}")
+    elif sensor == "mmwave":
+        targets_dict = data.get("targets", {})
+        if targets_dict:
+            _log_terminal(f"Detected {len(targets_dict)} targets:")
+            for name, target_data in targets_dict.items():
+                angle, distance = target_data
+                _log_terminal(f"  {name}: {angle:.1f}° @ {distance:.2f}m")
+        else:
+            _log_terminal("No targets detected")
+
+    updated_at = datetime.fromtimestamp(result.get("timestamp", time.time())).strftime("%H:%M:%S")
+    _log_terminal(f"Updated at: {updated_at}")
+
+
+def _read_with_logging(
+    sensor_key: str,
+    sensor_title: str,
+    request_func: Callable[[str], threading.Event],
+    dev_eui: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    _log_read_start(sensor_title)
+    try:
+        event = request_func(dev_eui)
+        result = _wait_and_get_result(dev_eui, sensor_key, event, timeout)
+    except Exception as e:
+        result = {
+            "ok": False,
+            "data": None,
+            "error": str(e),
+            "timestamp": time.time(),
+        }
+
+    _log_read_result(sensor_key, result)
+    return result
+
+
 def init(request_queue, communicator_module):
     """Initialize service with queue and communicator references."""
     global _request_queue, _communicator_module
@@ -29,12 +105,31 @@ def init(request_queue, communicator_module):
     _communicator_module = communicator_module
 
 
+def _ensure_initialized():
+    """Ensure service is initialized, auto-binding communicator on first use."""
+    global _request_queue, _communicator_module
+
+    if _request_queue is not None and _communicator_module is not None:
+        return
+
+    try:
+        import communicator as comm
+        if _request_queue is None:
+            _request_queue = getattr(comm, "request_queue", None)
+        if _communicator_module is None:
+            _communicator_module = comm
+    except Exception:
+        pass
+
+    if _request_queue is None or _communicator_module is None:
+        raise RuntimeError("Service not initialized")
+
+
 # ==================== Request Functions (called by GUI) ====================
 
 def request_read_ht(dev_eui: str) -> threading.Event:
     """Queue a humidity/temperature read request. Returns an Event that signals completion."""
-    if _request_queue is None:
-        raise RuntimeError("Service not initialized")
+    _ensure_initialized()
     event = threading.Event()
     _request_queue.put({
         "sensor": "ht",
@@ -47,8 +142,7 @@ def request_read_ht(dev_eui: str) -> threading.Event:
 
 def request_read_ta(dev_eui: str) -> threading.Event:
     """Queue a tilt/acceleration read request. Returns an Event that signals completion."""
-    if _request_queue is None:
-        raise RuntimeError("Service not initialized")
+    _ensure_initialized()
     event = threading.Event()
     _request_queue.put({
         "sensor": "ta",
@@ -61,8 +155,7 @@ def request_read_ta(dev_eui: str) -> threading.Event:
 
 def request_read_wl(dev_eui: str) -> threading.Event:
     """Queue a water level read request. Returns an Event that signals completion."""
-    if _request_queue is None:
-        raise RuntimeError("Service not initialized")
+    _ensure_initialized()
     event = threading.Event()
     _request_queue.put({
         "sensor": "wl",
@@ -75,8 +168,7 @@ def request_read_wl(dev_eui: str) -> threading.Event:
 
 def request_read_mmwave(dev_eui: str) -> threading.Event:
     """Queue a mmWave radar read request. Returns an Event that signals completion."""
-    if _request_queue is None:
-        raise RuntimeError("Service not initialized")
+    _ensure_initialized()
     event = threading.Event()
     _request_queue.put({
         "sensor": "mmwave",
@@ -85,6 +177,61 @@ def request_read_mmwave(dev_eui: str) -> threading.Event:
         "completion_event": event
     })
     return event
+
+
+def _wait_and_get_result(dev_eui: str, sensor: str, completion_event: threading.Event, timeout: float = 20.0) -> Dict[str, Any]:
+    """
+    Wait for queued read completion and return latest buffered result.
+    Returns: {"ok": bool, "data": any, "error": str|None, "timestamp": float}
+    """
+    try:
+        _ensure_initialized()
+    except Exception as e:
+        return {
+            "ok": False,
+            "data": None,
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+    completed = completion_event.wait(timeout=timeout)
+    if not completed:
+        return {
+            "ok": False,
+            "data": None,
+            "error": f"Timeout: no response after {int(timeout)} seconds",
+            "timestamp": time.time()
+        }
+
+    result = _communicator_module.get_buffer_data(dev_eui, sensor)
+    if result is None:
+        return {
+            "ok": False,
+            "data": None,
+            "error": "No data available",
+            "timestamp": time.time()
+        }
+    return result
+
+
+def read_ht(dev_eui: str, timeout: float = 20.0) -> Dict[str, Any]:
+    """Queue humidity/temperature read and return final result dict."""
+    return _read_with_logging("ht", "Humidity/Temperature Sensor", request_read_ht, dev_eui, timeout)
+
+
+def read_ta(dev_eui: str, timeout: float = 20.0) -> Dict[str, Any]:
+    """Queue tilt/acceleration read and return final result dict."""
+    return _read_with_logging("ta", "Tilt/Acceleration Sensor", request_read_ta, dev_eui, timeout)
+
+
+def read_wl(dev_eui: str, timeout: float = 20.0) -> Dict[str, Any]:
+    """Queue water-level read and return final result dict."""
+    return _read_with_logging("wl", "Water Level Sensor", request_read_wl, dev_eui, timeout)
+
+
+def read_mmwave(dev_eui: str, timeout: float = 20.0) -> Dict[str, Any]:
+    """Queue mmWave read and return final result dict."""
+    return _read_with_logging("mmwave", "mmWave Radar Sensor", request_read_mmwave, dev_eui, timeout)
 
 
 # ==================== Execute Functions (called by communicator worker) ====================
