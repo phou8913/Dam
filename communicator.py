@@ -1,8 +1,9 @@
 """
-LoRa API Communicator with Per-DTU Rate Limiting
+LoRa API Communicator
 Unified interface for both fake and real LoRa gateway APIs.
-- Per-DTU request queueing to enforce minimum send interval
+- Task queue with a single background worker that decodes tasks and calls the correct API
 - Request-response matching with timeout
+- Per-DTU inflight lock to prevent response mismatching
 """
 
 import os
@@ -13,7 +14,6 @@ import base64
 import struct
 from datetime import datetime
 from typing import Optional, Tuple, Any, Dict, Callable, List
-from collections import defaultdict
 
 
 # ==================== Import Configuration ====================
@@ -150,11 +150,11 @@ buffer_lock = threading.Lock()
 def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
     """
     Safely get latest buffer data for a device and sensor.
-    
+
     Args:
         dev_eui: Device EUI
         sensor: Sensor type ("ht", "ta", "wl", "mmwave")
-    
+
     Returns:
         dict: {"ok": bool, "data": {...}, "error": str, "timestamp": float} or None
     """
@@ -171,125 +171,59 @@ def _buffer_worker():
     """
     # Import here to avoid circular dependency
     import sensor_service as ss
-    
+
+    _SENSOR_EXECUTORS = {
+        "ht": ss.execute_read_ht,
+        "ta": ss.execute_read_ta,
+        "wl": ss.execute_read_wl,
+        "mmwave": ss.execute_read_mmwave,
+    }
+
     while True:
         try:
-            # Block until a request is available
+            # Block until a task is available
             task = request_queue.get(timeout=1.0)
-            
+
             if task is None:  # Poison pill to stop worker
                 break
-            
+
             dev_eui = task.get("dev_eui")
             sensor = task.get("sensor")
             completion_event = task.get("completion_event")
-            
+
             if not dev_eui or not sensor:
                 print("[_buffer_worker] Invalid task, skipping")
                 if completion_event:
                     completion_event.set()
                 continue
-            
-            # Execute queued sensor task through unified bundled dispatcher
+
+            # Decode task: call the correct API for this sensor type
+            execute_fn = _SENSOR_EXECUTORS.get(sensor)
             result = None
             try:
-                result = ss.execute_bundled_read(task)
+                if execute_fn is None:
+                    raise ValueError(f"Unsupported sensor type: {sensor!r} (supported: ht, ta, wl, mmwave)")
+                result = execute_fn(dev_eui)
             except Exception as e:
                 result = {"ok": False, "data": None, "error": f"Worker exception: {str(e)}", "timestamp": time.time()}
-            
-            # Update buffer with result
+
+            # Update the data buffer
             if result:
                 with buffer_lock:
                     if dev_eui not in buffer:
                         buffer[dev_eui] = {}
                     buffer[dev_eui][sensor] = result
                     print(f"[_buffer_worker] Updated buffer: {dev_eui}/{sensor} ok={result['ok']}")
-            
+
             # Signal completion to waiting GUI thread
             if completion_event:
                 completion_event.set()
-        
+
         except queue.Empty:
             continue
         except Exception as e:
             print(f"[_buffer_worker] Unexpected error: {e}")
 
-
-# ==================== Per-DTU Rate Limiter ====================
-class DTUQueue:
-    """
-    Per-DTU message queue with rate limiting.
-    Ensures minimum interval between consecutive sends to same DTU.
-    """
-
-    def __init__(self, dev_eui: str, min_interval_sec: float = 1.0):
-        self.dev_eui = dev_eui
-        self.min_interval_sec = min_interval_sec
-        self._queue = queue.Queue()
-        self._last_send_time = 0.0
-        self._lock = threading.Lock()
-        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self._worker_thread.start()
-
-    def _worker(self):
-        """Worker thread: process queue with rate limiting."""
-        while True:
-            try:
-                task = self._queue.get(timeout=0.1)
-                if task is None:
-                    break
-
-                send_func, send_args, send_kwargs, result_holder, completion_event = task
-
-                with self._lock:
-                    elapsed = time.time() - self._last_send_time
-                    if elapsed < self.min_interval_sec:
-                        time.sleep(self.min_interval_sec - elapsed)
-                    self._last_send_time = time.time()
-
-                try:
-                    result = send_func(*send_args, **send_kwargs)
-                    result_holder["result"] = result
-                    result_holder["error"] = None
-                except Exception as e:
-                    result_holder["result"] = None
-                    result_holder["error"] = str(e)
-                finally:
-                    completion_event.set()
-
-            except queue.Empty:
-                continue
-
-    def send(self, send_func: Callable, *args, timeout: float = 30.0, **kwargs) -> Tuple[int, Optional[Any]]:
-        """
-        Queue a send operation and wait for result.
-
-        Args:
-            send_func: Function to execute
-            timeout: Timeout in seconds for waiting on result
-            *args, **kwargs: Arguments to pass to send_func
-
-        Returns:
-            tuple: (status, response) from send_func
-        """
-        result_holder = {"result": None, "error": None}
-        completion_event = threading.Event()
-        self._queue.put((send_func, args, kwargs, result_holder, completion_event))
-
-        if completion_event.wait(timeout):
-            if result_holder["error"]:
-                return (0, None)
-            result = result_holder["result"]
-            if result is None:
-                return (0, None)
-            return result
-        else:
-            return (0, None)
-
-
-# Global DTU queues
-_DTU_QUEUES: Dict[str, DTUQueue] = {}
-_QUEUE_LOCK = threading.Lock()
 
 # Track last response timestamp per device to avoid reusing responses
 _LAST_RESPONSE_TS: Dict[str, float] = {}
@@ -311,14 +245,6 @@ def _get_inflight_lock(dev_eui: str) -> threading.Lock:
         return lock
 
 
-def _get_dtu_queue(dev_eui: str, min_interval_sec: float = 1.0) -> DTUQueue:
-    """Get or create DTU queue."""
-    with _QUEUE_LOCK:
-        if dev_eui not in _DTU_QUEUES:
-            _DTU_QUEUES[dev_eui] = DTUQueue(dev_eui, min_interval_sec)
-        return _DTU_QUEUES[dev_eui]
-
-
 # ==================== Public API ====================
 
 def get_token() -> str:
@@ -331,12 +257,10 @@ def send_request(
     data_to_send: str,
     auth_token: str,
     fport: int = 1,
-    reference: str = "downlink-cmd",
-    min_interval_sec: float = 1.0,
-    timeout: float = 30.0
+    reference: str = "downlink-cmd"
 ) -> Tuple[int, Optional[Any]]:
     """
-    Send downlink with per-DTU rate limiting.
+    Send downlink to a LoRa device.
 
     Args:
         device_id: Device EUI
@@ -344,18 +268,11 @@ def send_request(
         auth_token: Authentication token
         fport: LoRaWAN fPort
         reference: Reference identifier
-        min_interval_sec: Minimum interval (seconds) between sends to this DTU
-        timeout: Timeout in seconds for waiting on send completion
 
     Returns:
         tuple: (status, response)
     """
-    queue = _get_dtu_queue(device_id, min_interval_sec)
-
-    def _do_send():
-        return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
-
-    return queue.send(_do_send, timeout=timeout)
+    return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
 
 
 def pull_latest_data(
@@ -403,12 +320,11 @@ def send_and_wait(
     timeout_sec: float = 30.0,
     fport: int = 1,
     reference: str = "downlink-cmd",
-    min_interval_sec: float = 1.0,
     poll_interval_sec: float = 1.0
 ) -> Tuple[int, Optional[str]]:
     """
     Send request and wait for matching response.
-    
+
     Uses per-DTU inflight lock to ensure that requests to the same device_id
     are processed serially (send + wait + consume), preventing response mismatching
     when multiple threads are sending to the same DTU.
@@ -421,7 +337,6 @@ def send_and_wait(
         timeout_sec: Timeout in seconds
         fport: LoRaWAN fPort for downlink
         reference: Reference identifier
-        min_interval_sec: Minimum interval between sends to this DTU
         poll_interval_sec: Interval between uplink polls
 
     Returns:
@@ -429,7 +344,7 @@ def send_and_wait(
     """
     # Acquire per-DTU inflight lock to serialize send+wait for same device
     lock = _get_inflight_lock(device_id)
-    
+
     with lock:
         # Send the request
         send_time = time.time()
@@ -439,8 +354,6 @@ def send_and_wait(
             auth_token,
             fport,
             reference,
-            min_interval_sec=min_interval_sec,
-            timeout=timeout_sec,
         )
 
         if status != 1:
@@ -461,7 +374,7 @@ def send_and_wait(
                 # Re-read last_resp_ts for each uplink to catch updates from other threads
                 with _RESPONSE_TS_LOCK:
                     last_resp_ts = _LAST_RESPONSE_TS.get(device_id, 0.0)
-                
+
                 if uplink["ts"] <= last_resp_ts:
                     continue  # Already used this response before
                 if uplink["ts"] < send_time:
