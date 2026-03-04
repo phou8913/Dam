@@ -133,15 +133,12 @@ def _ensure_initialized():
         raise RuntimeError("Service not initialized")
 
 
-def _queue_bundled_read(sensor: str, dev_eui: str, steps: list[str]) -> threading.Event:
+def _queue_bundled_read(sensor: str, dev_eui: str) -> threading.Event:
     _ensure_initialized()
     event = threading.Event()
     _request_queue.put({
-        "type": "bundle",
         "sensor": sensor,
         "dev_eui": dev_eui,
-        "steps": steps,
-        "timestamp": time.time(),
         "completion_event": event,
     })
     return event
@@ -151,22 +148,22 @@ def _queue_bundled_read(sensor: str, dev_eui: str, steps: list[str]) -> threadin
 
 def request_read_ht(dev_eui: str) -> threading.Event:
     """Queue a humidity/temperature read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("ht", dev_eui, BUNDLED_SENSOR_STEPS["ht"])
+    return _queue_bundled_read("ht", dev_eui)
 
 
 def request_read_ta(dev_eui: str) -> threading.Event:
     """Queue a tilt/acceleration read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("ta", dev_eui, BUNDLED_SENSOR_STEPS["ta"])
+    return _queue_bundled_read("ta", dev_eui)
 
 
 def request_read_wl(dev_eui: str) -> threading.Event:
     """Queue a water level read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("wl", dev_eui, BUNDLED_SENSOR_STEPS["wl"])
+    return _queue_bundled_read("wl", dev_eui)
 
 
 def request_read_mmwave(dev_eui: str) -> threading.Event:
     """Queue a mmWave radar read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("mmwave", dev_eui, BUNDLED_SENSOR_STEPS["mmwave"])
+    return _queue_bundled_read("mmwave", dev_eui)
 
 
 def _wait_and_get_result(dev_eui: str, sensor: str, completion_event: threading.Event, timeout: float = 20.0) -> Dict[str, Any]:
@@ -270,7 +267,6 @@ def _ta_step_unlock(dev_eui: str, token: str, profile: HWT901BSensor) -> tuple[b
         device_id=dev_eui,
         data_to_send=unlock_cmd,
         auth_token=token,
-        min_interval_sec=1.0,
     )
     if status != 1:
         return False, "Failed to send unlock command"
@@ -287,7 +283,6 @@ def _ta_step_read_angles(dev_eui: str, token: str, profile: HWT901BSensor) -> tu
         timeout_sec=15.0,
         fport=1,
         reference="angles-read",
-        min_interval_sec=1.0,
         poll_interval_sec=1.0,
     )
     if status != 1 or not angles_hex:
@@ -308,7 +303,6 @@ def _ta_step_read_accel(dev_eui: str, token: str, profile: HWT901BSensor) -> tup
         timeout_sec=15.0,
         fport=1,
         reference="accel-read",
-        min_interval_sec=1.0,
         poll_interval_sec=1.0,
     )
     if status != 1 or not accel_hex:
@@ -376,7 +370,6 @@ def _ht_step_read(dev_eui: str, token: str, profile: HumidityTempSensor) -> tupl
         timeout_sec=15.0,
         fport=1,
         reference="humidity-read",
-        min_interval_sec=1.0,
         poll_interval_sec=1.0,
     )
     if status != 1 or not hex_data:
@@ -397,7 +390,6 @@ def _wl_step_read(dev_eui: str, token: str, profile: WaterLevelSensor) -> tuple[
         timeout_sec=15.0,
         fport=1,
         reference="water-level-read",
-        min_interval_sec=1.0,
         poll_interval_sec=1.0,
     )
     if status != 1 or not hex_data:
@@ -508,39 +500,3 @@ def _execute_mmwave_bundled_steps(dev_eui: str, steps: list[str], profile: MMWav
             "error": str(e),
             "timestamp": time.time(),
         }
-
-
-# ==================== Bundle Dispatcher ====================
-
-def execute_bundled_read(task: Dict[str, Any]) -> Dict[str, Any]:
-    sensor = task.get("sensor")
-    dev_eui = task.get("dev_eui")
-
-    if not dev_eui or not sensor:
-        return {
-            "ok": False,
-            "data": None,
-            "error": "Invalid bundled task",
-            "timestamp": time.time(),
-        }
-
-    sensor_key = str(sensor)
-    steps = task.get("steps") or BUNDLED_SENSOR_STEPS.get(sensor_key, [])
-
-    if sensor_key == "ta":
-        return _execute_ta_bundled_steps(dev_eui, steps)
-    if sensor_key == "ht":
-        return _execute_ht_bundled_steps(dev_eui, steps)
-    if sensor_key == "wl":
-        return _execute_wl_bundled_steps(dev_eui, steps)
-    if sensor_key == "mmwave":
-        return _execute_mmwave_bundled_steps(dev_eui, steps)
-
-    return {
-        "ok": False,
-        "data": None,
-        "error": f"Bundled execution unsupported for sensor: {sensor_key}",
-        "timestamp": time.time(),
-    }
-
-
