@@ -164,55 +164,37 @@ def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _buffer_worker():
-    """
-    Background worker thread that processes sensor read requests from the queue,
-    executes them, and updates the buffer.
-    """
-    # Import here to avoid circular dependency
-    import sensor_service as ss
-    
+def update_buffer_data(dev_eui: str, sensor: str, result: Dict[str, Any]):
+    """Update buffer with the latest sensor result for a device."""
+    with buffer_lock:
+        if dev_eui not in buffer:
+            buffer[dev_eui] = {}
+        buffer[dev_eui][sensor] = result
+        print(f"[update_buffer_data] Updated buffer: {dev_eui}/{sensor} ok={result.get('ok')}")
+
+
+def _worker():
+    """Background worker thread that processes tasks from the queue."""
     while True:
         try:
-            # Block until a request is available
             task = request_queue.get(timeout=1.0)
-            
+
             if task is None:  # Poison pill to stop worker
                 break
-            
-            dev_eui = task.get("dev_eui")
-            sensor = task.get("sensor")
-            completion_event = task.get("completion_event")
-            
-            if not dev_eui or not sensor:
-                print("[_buffer_worker] Invalid task, skipping")
+
+            func, completion_event = task
+            try:
+                func()
+            except Exception as e:
+                print(f"[_worker] Unexpected error: {e}")
+            finally:
                 if completion_event:
                     completion_event.set()
-                continue
-            
-            # Execute queued sensor task through unified bundled dispatcher
-            result = None
-            try:
-                result = ss.execute_bundled_read(task)
-            except Exception as e:
-                result = {"ok": False, "data": None, "error": f"Worker exception: {str(e)}", "timestamp": time.time()}
-            
-            # Update buffer with result
-            if result:
-                with buffer_lock:
-                    if dev_eui not in buffer:
-                        buffer[dev_eui] = {}
-                    buffer[dev_eui][sensor] = result
-                    print(f"[_buffer_worker] Updated buffer: {dev_eui}/{sensor} ok={result['ok']}")
-            
-            # Signal completion to waiting GUI thread
-            if completion_event:
-                completion_event.set()
-        
+
         except queue.Empty:
             continue
         except Exception as e:
-            print(f"[_buffer_worker] Unexpected error: {e}")
+            print(f"[_worker] Unexpected error: {e}")
 
 
 # ==================== Per-DTU Rate Limiter ====================
@@ -485,7 +467,7 @@ def send_and_wait(
         return (0, None)
 
 
-# ==================== Initialize and Start Buffer Worker ====================
+# ==================== Initialize and Start Worker ====================
 
 def _initialize_service():
     """Initialize sensor_service with references to queue and communicator."""
@@ -496,8 +478,8 @@ def _initialize_service():
         print("[initialize_service] sensor_service not yet available, will retry later")
 
 
-# Start the buffer worker thread as a daemon
-_worker_thread = threading.Thread(target=_buffer_worker, daemon=True)
+# Start the worker thread as a daemon
+_worker_thread = threading.Thread(target=_worker, daemon=True)
 _worker_thread.start()
 
 # Initialize sensor service

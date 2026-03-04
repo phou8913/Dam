@@ -136,14 +136,15 @@ def _ensure_initialized():
 def _queue_bundled_read(sensor: str, dev_eui: str, steps: list[str]) -> threading.Event:
     _ensure_initialized()
     event = threading.Event()
-    _request_queue.put({
-        "type": "bundle",
-        "sensor": sensor,
-        "dev_eui": dev_eui,
-        "steps": steps,
-        "timestamp": time.time(),
-        "completion_event": event,
-    })
+
+    def _execute():
+        try:
+            result = execute_bundled_read({"sensor": sensor, "dev_eui": dev_eui, "steps": steps})
+        except Exception as e:
+            result = {"ok": False, "data": None, "error": f"Worker exception: {str(e)}", "timestamp": time.time()}
+        _communicator_module.update_buffer_data(dev_eui, sensor, result)
+
+    _request_queue.put((_execute, event))
     return event
 
 
