@@ -133,14 +133,13 @@ def _ensure_initialized():
         raise RuntimeError("Service not initialized")
 
 
-def _queue_bundled_read(sensor: str, dev_eui: str, steps: list[str]) -> threading.Event:
+def _queue_read_request(sensor: str, dev_eui: str) -> threading.Event:
     _ensure_initialized()
     event = threading.Event()
     _request_queue.put({
-        "type": "bundle",
+        "action": "read",
         "sensor": sensor,
         "dev_eui": dev_eui,
-        "steps": steps,
         "timestamp": time.time(),
         "completion_event": event,
     })
@@ -151,22 +150,22 @@ def _queue_bundled_read(sensor: str, dev_eui: str, steps: list[str]) -> threadin
 
 def request_read_ht(dev_eui: str) -> threading.Event:
     """Queue a humidity/temperature read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("ht", dev_eui, BUNDLED_SENSOR_STEPS["ht"])
+    return _queue_read_request("ht", dev_eui)
 
 
 def request_read_ta(dev_eui: str) -> threading.Event:
     """Queue a tilt/acceleration read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("ta", dev_eui, BUNDLED_SENSOR_STEPS["ta"])
+    return _queue_read_request("ta", dev_eui)
 
 
 def request_read_wl(dev_eui: str) -> threading.Event:
     """Queue a water level read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("wl", dev_eui, BUNDLED_SENSOR_STEPS["wl"])
+    return _queue_read_request("wl", dev_eui)
 
 
 def request_read_mmwave(dev_eui: str) -> threading.Event:
     """Queue a mmWave radar read request. Returns an Event that signals completion."""
-    return _queue_bundled_read("mmwave", dev_eui, BUNDLED_SENSOR_STEPS["mmwave"])
+    return _queue_read_request("mmwave", dev_eui)
 
 
 def _wait_and_get_result(dev_eui: str, sensor: str, completion_event: threading.Event, timeout: float = 20.0) -> Dict[str, Any]:

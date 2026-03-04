@@ -138,8 +138,8 @@ _backend = _Backend()
 
 
 # ==================== Request Queue and Buffer ====================
-# Request queue for sensor read tasks
-request_queue = queue.Queue()
+# Request queue adapter will be assigned during initialization wiring
+request_queue = None
 
 # Buffer to store latest results per device
 # Structure: {dev_eui: {sensor_type: {"ok": bool, "data": {...}, "error": str, "timestamp": float}}}
@@ -164,132 +164,134 @@ def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _buffer_worker():
-    """
-    Background worker thread that processes sensor read requests from the queue,
-    executes them, and updates the buffer.
-    """
-    # Import here to avoid circular dependency
-    import sensor_service as ss
-    
-    while True:
-        try:
-            # Block until a request is available
-            task = request_queue.get(timeout=1.0)
-            
-            if task is None:  # Poison pill to stop worker
-                break
-            
-            dev_eui = task.get("dev_eui")
-            sensor = task.get("sensor")
-            completion_event = task.get("completion_event")
-            
-            if not dev_eui or not sensor:
-                print("[_buffer_worker] Invalid task, skipping")
-                if completion_event:
-                    completion_event.set()
-                continue
-            
-            # Execute queued sensor task through unified bundled dispatcher
-            result = None
-            try:
-                result = ss.execute_bundled_read(task)
-            except Exception as e:
-                result = {"ok": False, "data": None, "error": f"Worker exception: {str(e)}", "timestamp": time.time()}
-            
-            # Update buffer with result
-            if result:
-                with buffer_lock:
-                    if dev_eui not in buffer:
-                        buffer[dev_eui] = {}
-                    buffer[dev_eui][sensor] = result
-                    print(f"[_buffer_worker] Updated buffer: {dev_eui}/{sensor} ok={result['ok']}")
-            
-            # Signal completion to waiting GUI thread
-            if completion_event:
-                completion_event.set()
-        
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[_buffer_worker] Unexpected error: {e}")
+def _error_result(error: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "data": None,
+        "error": error,
+        "timestamp": time.time(),
+    }
 
 
-# ==================== Per-DTU Rate Limiter ====================
-class DTUQueue:
-    """
-    Per-DTU message queue with rate limiting.
-    Ensures minimum interval between consecutive sends to same DTU.
-    """
+def _write_buffer_result(dev_eui: str, sensor: str, result: Dict[str, Any]):
+    with buffer_lock:
+        if dev_eui not in buffer:
+            buffer[dev_eui] = {}
+        buffer[dev_eui][sensor] = result
 
-    def __init__(self, dev_eui: str, min_interval_sec: float = 1.0):
+
+class _DeviceWorker:
+    """Single worker type: one worker instance per dev_eui."""
+
+    def __init__(self, dev_eui: str):
         self.dev_eui = dev_eui
-        self.min_interval_sec = min_interval_sec
         self._queue = queue.Queue()
-        self._last_send_time = 0.0
-        self._lock = threading.Lock()
-        self._worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self._worker_thread.start()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-    def _worker(self):
-        """Worker thread: process queue with rate limiting."""
+    def enqueue(self, task: Dict[str, Any]):
+        self._queue.put(task)
+
+    def _run(self):
+        import sensor_service as ss
+
+        dispatch_map: Dict[str, Callable[[str], Dict[str, Any]]] = {
+            "ht": ss.execute_read_ht,
+            "ta": ss.execute_read_ta,
+            "wl": ss.execute_read_wl,
+            "mmwave": ss.execute_read_mmwave,
+        }
+
         while True:
+            completion_event = None
+            task = None
             try:
-                task = self._queue.get(timeout=0.1)
+                task = self._queue.get(timeout=1.0)
                 if task is None:
                     break
 
-                send_func, send_args, send_kwargs, result_holder, completion_event = task
+                completion_event = task.get("completion_event")
+                action = task.get("action")
+                sensor = task.get("sensor")
+                task_dev_eui = task.get("dev_eui")
 
-                with self._lock:
-                    elapsed = time.time() - self._last_send_time
-                    if elapsed < self.min_interval_sec:
-                        time.sleep(self.min_interval_sec - elapsed)
-                    self._last_send_time = time.time()
+                if action != "read":
+                    raise ValueError(f"Unsupported task action: {action}")
+                if task_dev_eui != self.dev_eui:
+                    raise ValueError(f"Task dev_eui mismatch: expected {self.dev_eui}, got {task_dev_eui}")
+                if sensor not in dispatch_map:
+                    raise ValueError(f"Unsupported sensor: {sensor}")
 
-                try:
-                    result = send_func(*send_args, **send_kwargs)
-                    result_holder["result"] = result
-                    result_holder["error"] = None
-                except Exception as e:
-                    result_holder["result"] = None
-                    result_holder["error"] = str(e)
-                finally:
-                    completion_event.set()
+                executor = dispatch_map[sensor]
+                result = executor(self.dev_eui)
+                if not isinstance(result, dict):
+                    result = _error_result("Executor returned invalid result type")
+
+                _write_buffer_result(self.dev_eui, sensor, result)
+                print(f"[_DeviceWorker:{self.dev_eui}] Updated buffer {sensor} ok={bool(result.get('ok'))}")
 
             except queue.Empty:
                 continue
-
-    def send(self, send_func: Callable, *args, timeout: float = 30.0, **kwargs) -> Tuple[int, Optional[Any]]:
-        """
-        Queue a send operation and wait for result.
-
-        Args:
-            send_func: Function to execute
-            timeout: Timeout in seconds for waiting on result
-            *args, **kwargs: Arguments to pass to send_func
-
-        Returns:
-            tuple: (status, response) from send_func
-        """
-        result_holder = {"result": None, "error": None}
-        completion_event = threading.Event()
-        self._queue.put((send_func, args, kwargs, result_holder, completion_event))
-
-        if completion_event.wait(timeout):
-            if result_holder["error"]:
-                return (0, None)
-            result = result_holder["result"]
-            if result is None:
-                return (0, None)
-            return result
-        else:
-            return (0, None)
+            except Exception as e:
+                try:
+                    if isinstance(task, dict):
+                        task_sensor = task.get("sensor")
+                        task_dev_eui = task.get("dev_eui")
+                        if task_sensor and task_dev_eui:
+                            _write_buffer_result(task_dev_eui, task_sensor, _error_result(f"Worker exception: {str(e)}"))
+                    print(f"[_DeviceWorker:{self.dev_eui}] Error: {e}")
+                except Exception as inner_e:
+                    print(f"[_DeviceWorker:{self.dev_eui}] Failed to store error result: {inner_e}")
+            finally:
+                if completion_event:
+                    completion_event.set()
 
 
-# Global DTU queues
-_DTU_QUEUES: Dict[str, DTUQueue] = {}
-_QUEUE_LOCK = threading.Lock()
+_DEVICE_WORKERS: Dict[str, _DeviceWorker] = {}
+_DEVICE_WORKERS_LOCK = threading.Lock()
+
+
+def _get_device_worker(dev_eui: str) -> _DeviceWorker:
+    with _DEVICE_WORKERS_LOCK:
+        worker = _DEVICE_WORKERS.get(dev_eui)
+        if worker is None:
+            worker = _DeviceWorker(dev_eui)
+            _DEVICE_WORKERS[dev_eui] = worker
+        return worker
+
+
+class _TaskRouterQueue:
+    """Queue-like adapter used by sensor_service: routes tasks to per-device worker."""
+
+    def put(self, task: Dict[str, Any]):
+        if not isinstance(task, dict):
+            raise ValueError("Task must be a dict")
+
+        dev_eui = task.get("dev_eui")
+        completion_event = task.get("completion_event")
+        sensor = task.get("sensor")
+
+        if not dev_eui or not sensor:
+            if completion_event:
+                completion_event.set()
+            raise ValueError("Task missing required fields: dev_eui/sensor")
+
+        worker = _get_device_worker(str(dev_eui))
+        worker.enqueue(task)
+
+
+_LAST_SEND_TS: Dict[str, float] = {}
+_SEND_LOCKS: Dict[str, threading.Lock] = {}
+_SEND_LOCKS_GUARD = threading.Lock()
+
+
+def _get_send_lock(dev_eui: str) -> threading.Lock:
+    with _SEND_LOCKS_GUARD:
+        lock = _SEND_LOCKS.get(dev_eui)
+        if lock is None:
+            lock = threading.Lock()
+            _SEND_LOCKS[dev_eui] = lock
+        return lock
 
 # Track last response timestamp per device to avoid reusing responses
 _LAST_RESPONSE_TS: Dict[str, float] = {}
@@ -309,14 +311,6 @@ def _get_inflight_lock(dev_eui: str) -> threading.Lock:
             lock = threading.Lock()
             _INFLIGHT_LOCKS[dev_eui] = lock
         return lock
-
-
-def _get_dtu_queue(dev_eui: str, min_interval_sec: float = 1.0) -> DTUQueue:
-    """Get or create DTU queue."""
-    with _QUEUE_LOCK:
-        if dev_eui not in _DTU_QUEUES:
-            _DTU_QUEUES[dev_eui] = DTUQueue(dev_eui, min_interval_sec)
-        return _DTU_QUEUES[dev_eui]
 
 
 # ==================== Public API ====================
@@ -350,12 +344,14 @@ def send_request(
     Returns:
         tuple: (status, response)
     """
-    queue = _get_dtu_queue(device_id, min_interval_sec)
-
-    def _do_send():
+    send_lock = _get_send_lock(device_id)
+    with send_lock:
+        last_send_ts = _LAST_SEND_TS.get(device_id, 0.0)
+        elapsed = time.time() - last_send_ts
+        if elapsed < min_interval_sec:
+            time.sleep(min_interval_sec - elapsed)
+        _LAST_SEND_TS[device_id] = time.time()
         return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
-
-    return queue.send(_do_send, timeout=timeout)
 
 
 def pull_latest_data(
@@ -485,7 +481,7 @@ def send_and_wait(
         return (0, None)
 
 
-# ==================== Initialize and Start Buffer Worker ====================
+# ==================== Initialize Service Wiring ====================
 
 def _initialize_service():
     """Initialize sensor_service with references to queue and communicator."""
@@ -496,9 +492,11 @@ def _initialize_service():
         print("[initialize_service] sensor_service not yet available, will retry later")
 
 
-# Start the buffer worker thread as a daemon
-_worker_thread = threading.Thread(target=_buffer_worker, daemon=True)
-_worker_thread.start()
+# Queue adapter routes each task to its per-device worker
+request_queue = _TaskRouterQueue()
 
 # Initialize sensor service
 _initialize_service()
+
+
+
