@@ -36,6 +36,63 @@ ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
 PASSWORD = os.getenv("LORA_PASSWORD", "admin")
 
 
+# Terminal logging helpers for queued requests and sensor results.
+_SENSOR_LABELS = {
+    "ht": "Humidity/Temperature Sensor",
+    "ta": "Tilt/Acceleration Sensor",
+    "wl": "Water Level Sensor",
+    "mmwave": "mmWave Radar Sensor",
+}
+
+
+def _log_line(message: str = ""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}")
+
+
+def _log_sensor_header(sensor: str):
+    _log_line()
+    print(f"--- {_SENSOR_LABELS.get(sensor, sensor)} ---")
+
+
+def _log_sensor_result(sensor: str, result: Dict[str, Any]):
+    data = result.get("data") or {}
+    if not result.get("ok"):
+        _log_line(f"Error: {result.get('error') or 'Unknown error'}")
+        return
+
+    if sensor == "ht":
+        _log_line(f"Temperature: {data.get('temperature_c', 0.0):.2f} °C")
+        _log_line(f"Humidity: {data.get('humidity_rh', 0.0):.2f} %RH")
+        _log_line(f"Dewpoint: {data.get('dewpoint_c', 0.0):.2f} °C")
+        _log_line(f"CRC Valid: {data.get('crc_valid', '--')}")
+        _log_line(f"Raw: {data.get('raw_hex', '--')}")
+    elif sensor == "ta":
+        _log_line(f"Roll: {data.get('roll', 0.0):.2f}°")
+        _log_line(f"Pitch: {data.get('pitch', 0.0):.2f}°")
+        _log_line(f"Yaw: {data.get('yaw', 0.0):.2f}°")
+        _log_line(f"Ax: {data.get('ax_g', 0.0):.3f}g ({data.get('ax_ms2', 0.0):.2f} m/s²)")
+        _log_line(f"Ay: {data.get('ay_g', 0.0):.3f}g ({data.get('ay_ms2', 0.0):.2f} m/s²)")
+        _log_line(f"Az: {data.get('az_g', 0.0):.3f}g ({data.get('az_ms2', 0.0):.2f} m/s²)")
+        _log_line(f"Raw: {data.get('raw_hex', '--')}")
+    elif sensor == "wl":
+        _log_line(f"Water Level: {data.get('level_m', 0.0):.3f} m")
+        _log_line(f"CRC Valid: {data.get('crc_valid', '--')}")
+        _log_line(f"Raw: {data.get('raw_hex', '--')}")
+    elif sensor == "mmwave":
+        targets = data.get("targets", {}) if isinstance(data, dict) else {}
+        _log_line(f"Detected {len(targets)} targets:")
+        for target_name, target_data in targets.items():
+            if len(target_data) >= 2:
+                angle, distance = target_data[0], target_data[1]
+                _log_line(f"  {target_name}: {angle:.1f}° @ {distance:.2f}m")
+    else:
+        _log_line(f"Result: {data}")
+
+    updated_at = datetime.now().strftime("%H:%M:%S")
+    _log_line(f"Updated at: {updated_at}")
+
+
 # Shared queues and buffers used across threads.
 request_queue = queue.Queue()
 
@@ -103,6 +160,8 @@ def _write_buffer_result(dev_eui: str, sensor: str, result: Dict[str, Any]):
 ### gui.py uses this to request a new reading for a given device and sensor.
 def enqueue_request(dev_eui: str, sensor: str):
     # The GUI only queues work; device workers do the blocking I/O.
+    _log_sensor_header(sensor)
+    _log_line("Read request queued, waiting for response...")
     request_queue.put({
         "dev_eui": str(dev_eui).strip(),
         "sensor": str(sensor).strip(),
@@ -159,7 +218,7 @@ def _handle_request(task: Dict[str, Any]):
     if not dev_eui or not sensor:
         return
 
-    dispatch_map: Dict[str, Callable[[str], Dict[str, Any]]] = {
+    dispatch_map = {
         "ht": read_ht,
         "ta": read_ta,
         "wl": read_wl,
@@ -173,6 +232,8 @@ def _handle_request(task: Dict[str, Any]):
         result = reader(dev_eui)
 
     _write_buffer_result(dev_eui, sensor, result)
+    print(f"[_DeviceWorker:{dev_eui}] Updated buffer {sensor} ok={result.get('ok', False)}")
+    _log_sensor_result(sensor, result)
 
 
 def _get_device_worker(dev_eui: str) -> _DeviceWorker:
