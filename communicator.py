@@ -1,8 +1,5 @@
 """
-LoRa API Communicator with Per-DTU Rate Limiting
-Unified interface for both fake and real LoRa gateway APIs.
-- Per-DTU request queueing to enforce minimum send interval
-- Request-response matching with timeout
+LoRa API communicator with per-device request queues and latest-result buffer.
 """
 
 import os
@@ -10,24 +7,33 @@ import time
 import threading
 import queue
 import base64
-import struct
 from datetime import datetime
 from typing import Optional, Tuple, Any, Dict, Callable, List
-from collections import defaultdict
 
-
-# ==================== Import Configuration ====================
 import requests
+
+from humidity_temp_sensor import HumidityTempSensor
+from tilt_acc_sensor import HWT901BSensor
+from water_level_sensor import WaterLevelSensor
+from mmwave_sensor import MMWaveSensor
+
 
 USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
 
-if USE_FAKE_SERVER:
-    DEFAULT_BASE_URL = "http://localhost:5000/api"
-else:
-    DEFAULT_BASE_URL = "http://99.10.226.29:4560/api"
+REAL_BASE_URL = "http://99.10.226.29:4560/api"
+FAKE_BASE_URL = "http://localhost:5000/api"
+
+
+def _default_base_url(use_fake_server: bool) -> str:
+    return FAKE_BASE_URL if use_fake_server else REAL_BASE_URL
+
+
+# Switch the HTTP target depending on whether local simulation is enabled.
+DEFAULT_BASE_URL = _default_base_url(USE_FAKE_SERVER)
+
 
 class _Backend:
-    """Unified LoRa API communicator (works with real or fake HTTP server)"""
+    """Unified LoRa API communicator (works with real or fake HTTP server)."""
 
     BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
     ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
@@ -35,11 +41,10 @@ class _Backend:
 
     @staticmethod
     def get_token() -> str:
-        """Authenticate with the API and retrieve JWT token."""
         url = f"{_Backend.BASE_URL}/v1/internal/auth"
         payload = {
             "account": _Backend.ACCOUNT,
-            "password": _Backend.PASSWORD
+            "password": _Backend.PASSWORD,
         }
         try:
             response = requests.post(url, json=payload)
@@ -57,39 +62,34 @@ class _Backend:
         data_to_send: str,
         auth_token: str,
         fport: int = 1,
-        reference: str = "downlink-cmd"
+        reference: str = "downlink-cmd",
     ) -> Tuple[int, Optional[Any]]:
-        """Send downlink request to a LoRa device."""
         try:
             url = f"{_Backend.BASE_URL}/v1/devices/{device_id}/queue"
             headers = {
                 "token": auth_token,
-                "content-type": "application/json"
+                "content-type": "application/json",
             }
             payload = {
                 "confirmed": True,
                 "mode": "hex",
                 "data": data_to_send,
                 "fPort": fport,
-                "reference": reference
+                "reference": reference,
             }
             response = requests.post(url, json=payload, headers=headers)
             response.raise_for_status()
-            return (1, response.json())
+            return 1, response.json()
         except Exception as e:
             print(f"Error sending request: {e}")
-            return (0, None)
+            return 0, None
 
     @staticmethod
     def pull_latest_uplinks(
         device_id: str,
         auth_token: str,
-        size: int = 10
+        size: int = 10,
     ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-        """
-        Pull latest uplinks with timestamp and metadata.
-        Returns list of dicts: {ts, fport, hex, ...}
-        """
         try:
             url = f"{_Backend.BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
             headers = {"token": auth_token}
@@ -98,12 +98,12 @@ class _Backend:
             response.raise_for_status()
 
             uplinks_raw = response.json().get("result", [])
-            uplinks = []
+            uplinks: List[Dict[str, Any]] = []
 
-            for u in uplinks_raw:
-                raw_b64 = u.get("data")
-                fport = u.get("fPort", 0)
-                ts_str = u.get("insertTime")
+            for uplink in uplinks_raw:
+                raw_b64 = uplink.get("data")
+                fport = uplink.get("fPort", 0)
+                ts_str = uplink.get("insertTime")
                 if ts_str:
                     try:
                         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
@@ -116,61 +116,80 @@ class _Backend:
                 if raw_b64 and fport > 0:
                     try:
                         raw_bytes = base64.b64decode(raw_b64)
-                        hex_data = raw_bytes.hex()
                         uplinks.append({
                             "ts": ts,
                             "fport": fport,
-                            "hex": hex_data,
-                            "raw": u
+                            "hex": raw_bytes.hex(),
+                            "raw": uplink,
                         })
                     except Exception as e:
                         print(f"Warning: Failed to decode uplink: {e}")
 
             if uplinks:
-                return (1, uplinks)
-            return (0, None)
-
+                return 1, uplinks
+            return 0, None
         except Exception as e:
             print(f"Error pulling uplinks: {e}")
-            return (0, None)
+            return 0, None
+
 
 _backend = _Backend()
 
 
-# ==================== Request Queue and Buffer ====================
-# Request queue adapter will be assigned during initialization wiring
-request_queue = None
+# Shared queues and buffers used by the GUI and worker threads.
+request_queue = queue.Queue()
 
-# Buffer to store latest results per device
-# Structure: {dev_eui: {sensor_type: {"ok": bool, "data": {...}, "error": str, "timestamp": float}}}
-buffer = {}
+buffer: Dict[str, Dict[str, Dict[str, Any]]] = {}
 buffer_lock = threading.Lock()
 
+# Per-device coordination primitives keep requests ordered and rate-limited.
+_LAST_SEND_TS: Dict[str, float] = {}
+_SEND_LOCKS: Dict[str, threading.Lock] = {}
+_SEND_LOCKS_GUARD = threading.Lock()
 
-def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
-    """
-    Safely get latest buffer data for a device and sensor.
-    
-    Args:
-        dev_eui: Device EUI
-        sensor: Sensor type ("ht", "ta", "wl", "mmwave")
-    
-    Returns:
-        dict: {"ok": bool, "data": {...}, "error": str, "timestamp": float} or None
-    """
-    with buffer_lock:
-        if dev_eui in buffer and sensor in buffer[dev_eui]:
-            return buffer[dev_eui][sensor]
-    return None
+_LAST_RESPONSE_TS: Dict[str, float] = {}
+_RESPONSE_TS_LOCK = threading.Lock()
+
+_INFLIGHT_LOCKS: Dict[str, threading.Lock] = {}
+_INFLIGHT_LOCKS_GUARD = threading.Lock()
+
+_DEVICE_WORKERS: Dict[str, "_DeviceWorker"] = {}
+_DEVICE_WORKERS_LOCK = threading.Lock()
 
 
-def _error_result(error: str) -> Dict[str, Any]:
+def _result(ok: bool, data: Any = None, error: Optional[str] = None) -> Dict[str, Any]:
     return {
-        "ok": False,
-        "data": None,
+        "ok": ok,
+        "data": data,
         "error": error,
         "timestamp": time.time(),
     }
+
+
+def _error_result(error: str) -> Dict[str, Any]:
+    return _result(False, data=None, error=error)
+
+
+def configure_backend(mode: str = "real"):
+    """Switch communicator traffic between the real gateway and the fake local server."""
+    global USE_FAKE_SERVER, DEFAULT_BASE_URL, _backend
+
+    use_fake_server = mode == "fake"
+    USE_FAKE_SERVER = use_fake_server
+    DEFAULT_BASE_URL = _default_base_url(use_fake_server)
+
+    if use_fake_server:
+        os.environ["USE_FAKE_SERVER"] = "1"
+    else:
+        os.environ.pop("USE_FAKE_SERVER", None)
+
+    _Backend.BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
+    _backend = _Backend()
+
+
+def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
+    with buffer_lock:
+        return buffer.get(dev_eui, {}).get(sensor)
 
 
 def _write_buffer_result(dev_eui: str, sensor: str, result: Dict[str, Any]):
@@ -180,75 +199,53 @@ def _write_buffer_result(dev_eui: str, sensor: str, result: Dict[str, Any]):
         buffer[dev_eui][sensor] = result
 
 
+def enqueue_request(dev_eui: str, sensor: str):
+    # The GUI only queues work; device workers do the blocking I/O.
+    request_queue.put({
+        "dev_eui": str(dev_eui).strip(),
+        "sensor": str(sensor).strip(),
+        "timestamp": time.time(),
+    })
+
+
+def _get_send_lock(dev_eui: str) -> threading.Lock:
+    with _SEND_LOCKS_GUARD:
+        lock = _SEND_LOCKS.get(dev_eui)
+        if lock is None:
+            lock = threading.Lock()
+            _SEND_LOCKS[dev_eui] = lock
+        return lock
+
+
+def _get_inflight_lock(dev_eui: str) -> threading.Lock:
+    with _INFLIGHT_LOCKS_GUARD:
+        lock = _INFLIGHT_LOCKS.get(dev_eui)
+        if lock is None:
+            lock = threading.Lock()
+            _INFLIGHT_LOCKS[dev_eui] = lock
+        return lock
+
+
 class _DeviceWorker:
-    """Single worker type: one worker instance per dev_eui."""
+    """Serial worker for a single device EUI."""
 
     def __init__(self, dev_eui: str):
         self.dev_eui = dev_eui
-        self._queue = queue.Queue()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        self.queue: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
 
     def enqueue(self, task: Dict[str, Any]):
-        self._queue.put(task)
+        self.queue.put(task)
 
     def _run(self):
-        import sensor_service as ss
-
-        dispatch_map: Dict[str, Callable[[str], Dict[str, Any]]] = {
-            "ht": ss.execute_read_ht,
-            "ta": ss.execute_read_ta,
-            "wl": ss.execute_read_wl,
-            "mmwave": ss.execute_read_mmwave,
-        }
-
         while True:
-            completion_event = None
-            task = None
+            task = self.queue.get()
             try:
-                task = self._queue.get(timeout=1.0)
-                if task is None:
-                    break
-
-                completion_event = task.get("completion_event")
-                action = task.get("action")
-                sensor = task.get("sensor")
-                task_dev_eui = task.get("dev_eui")
-
-                if action != "read":
-                    raise ValueError(f"Unsupported task action: {action}")
-                if task_dev_eui != self.dev_eui:
-                    raise ValueError(f"Task dev_eui mismatch: expected {self.dev_eui}, got {task_dev_eui}")
-                if sensor not in dispatch_map:
-                    raise ValueError(f"Unsupported sensor: {sensor}")
-
-                executor = dispatch_map[sensor]
-                result = executor(self.dev_eui)
-                if not isinstance(result, dict):
-                    result = _error_result("Executor returned invalid result type")
-
-                _write_buffer_result(self.dev_eui, sensor, result)
-                print(f"[_DeviceWorker:{self.dev_eui}] Updated buffer {sensor} ok={bool(result.get('ok'))}")
-
-            except queue.Empty:
-                continue
+                _handle_request(task)
             except Exception as e:
-                try:
-                    if isinstance(task, dict):
-                        task_sensor = task.get("sensor")
-                        task_dev_eui = task.get("dev_eui")
-                        if task_sensor and task_dev_eui:
-                            _write_buffer_result(task_dev_eui, task_sensor, _error_result(f"Worker exception: {str(e)}"))
-                    print(f"[_DeviceWorker:{self.dev_eui}] Error: {e}")
-                except Exception as inner_e:
-                    print(f"[_DeviceWorker:{self.dev_eui}] Failed to store error result: {inner_e}")
-            finally:
-                if completion_event:
-                    completion_event.set()
-
-
-_DEVICE_WORKERS: Dict[str, _DeviceWorker] = {}
-_DEVICE_WORKERS_LOCK = threading.Lock()
+                sensor = task.get("sensor", "")
+                _write_buffer_result(self.dev_eui, sensor, _error_result(f"Worker exception: {e}"))
 
 
 def _get_device_worker(dev_eui: str) -> _DeviceWorker:
@@ -260,63 +257,30 @@ def _get_device_worker(dev_eui: str) -> _DeviceWorker:
         return worker
 
 
-class _TaskRouterQueue:
-    """Queue-like adapter used by sensor_service: routes tasks to per-device worker."""
-
-    def put(self, task: Dict[str, Any]):
-        if not isinstance(task, dict):
-            raise ValueError("Task must be a dict")
-
-        dev_eui = task.get("dev_eui")
-        completion_event = task.get("completion_event")
-        sensor = task.get("sensor")
-
-        if not dev_eui or not sensor:
-            if completion_event:
-                completion_event.set()
-            raise ValueError("Task missing required fields: dev_eui/sensor")
-
-        worker = _get_device_worker(str(dev_eui))
-        worker.enqueue(task)
+def _dispatch_request(task: Dict[str, Any]):
+    # Route each task to the worker dedicated to that device.
+    dev_eui = str(task.get("dev_eui", "")).strip()
+    sensor = str(task.get("sensor", "")).strip()
+    if not dev_eui or not sensor:
+        return
+    worker = _get_device_worker(dev_eui)
+    worker.enqueue(task)
 
 
-_LAST_SEND_TS: Dict[str, float] = {}
-_SEND_LOCKS: Dict[str, threading.Lock] = {}
-_SEND_LOCKS_GUARD = threading.Lock()
+def _request_router_loop():
+    # Global router fan-outs queued requests into per-device workers.
+    while True:
+        task = request_queue.get()
+        _dispatch_request(task)
 
 
-def _get_send_lock(dev_eui: str) -> threading.Lock:
-    with _SEND_LOCKS_GUARD:
-        lock = _SEND_LOCKS.get(dev_eui)
-        if lock is None:
-            lock = threading.Lock()
-            _SEND_LOCKS[dev_eui] = lock
-        return lock
+def start_router():
+    thread = threading.Thread(target=_request_router_loop, daemon=True)
+    thread.start()
+    return thread
 
-# Track last response timestamp per device to avoid reusing responses
-_LAST_RESPONSE_TS: Dict[str, float] = {}
-_RESPONSE_TS_LOCK = threading.Lock()
-
-# ==================== Per-DTU Inflight Lock ====================
-# Ensures that send_and_wait() for the same devEUI runs serially,
-# preventing multiple requests from competing for the same uplink response.
-_INFLIGHT_LOCKS: Dict[str, threading.Lock] = {}
-_INFLIGHT_LOCKS_GUARD = threading.Lock()
-
-def _get_inflight_lock(dev_eui: str) -> threading.Lock:
-    """Get or create the per-DTU inflight lock."""
-    with _INFLIGHT_LOCKS_GUARD:
-        lock = _INFLIGHT_LOCKS.get(dev_eui)
-        if lock is None:
-            lock = threading.Lock()
-            _INFLIGHT_LOCKS[dev_eui] = lock
-        return lock
-
-
-# ==================== Public API ====================
 
 def get_token() -> str:
-    """Get authentication token (route to backend)."""
     return _backend.get_token()
 
 
@@ -327,23 +291,10 @@ def send_request(
     fport: int = 1,
     reference: str = "downlink-cmd",
     min_interval_sec: float = 1.0,
-    timeout: float = 30.0
+    timeout: float = 30.0,
 ) -> Tuple[int, Optional[Any]]:
-    """
-    Send downlink with per-DTU rate limiting.
-
-    Args:
-        device_id: Device EUI
-        data_to_send: Hex string to send
-        auth_token: Authentication token
-        fport: LoRaWAN fPort
-        reference: Reference identifier
-        min_interval_sec: Minimum interval (seconds) between sends to this DTU
-        timeout: Timeout in seconds for waiting on send completion
-
-    Returns:
-        tuple: (status, response)
-    """
+    del timeout
+    # Enforce minimum spacing so repeated downlinks do not pile up too quickly.
     send_lock = _get_send_lock(device_id)
     with send_lock:
         last_send_ts = _LAST_SEND_TS.get(device_id, 0.0)
@@ -354,41 +305,23 @@ def send_request(
         return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
 
 
-def pull_latest_data(
-    device_id: str,
-    auth_token: str,
-    size: int = 10
-) -> Tuple[int, Optional[str]]:
-    """
-    Pull latest uplink data (for mmWave sensor compatibility).
-
-    Args:
-        device_id: Device EUI
-        auth_token: Authentication token
-        size: Number of uplinks to retrieve
-
-    Returns:
-        tuple: (status, hex_string) - returns the most recent uplink hex data
-    """
-    status, uplinks = pull_latest_uplinks(device_id, auth_token, size)
-    if status != 1 or not uplinks:
-        return (0, None)
-    # Return the most recent uplink's hex data
-    return (1, uplinks[0]["hex"])
-
-
 def pull_latest_uplinks(
     device_id: str,
     auth_token: str,
-    size: int = 10
+    size: int = 10,
 ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-    """
-    Pull latest uplinks with timestamp info.
-
-    Returns:
-        tuple: (status, list of {ts, fport, hex, raw})
-    """
     return _backend.pull_latest_uplinks(device_id, auth_token, size)
+
+
+def pull_latest_data(
+    device_id: str,
+    auth_token: str,
+    size: int = 10,
+) -> Tuple[int, Optional[str]]:
+    status, uplinks = pull_latest_uplinks(device_id, auth_token, size)
+    if status != 1 or not uplinks:
+        return 0, None
+    return 1, uplinks[0]["hex"]
 
 
 def send_and_wait(
@@ -400,36 +333,13 @@ def send_and_wait(
     fport: int = 1,
     reference: str = "downlink-cmd",
     min_interval_sec: float = 1.0,
-    poll_interval_sec: float = 1.0
+    poll_interval_sec: float = 1.0,
 ) -> Tuple[int, Optional[str]]:
-    """
-    Send request and wait for matching response.
-    
-    Uses per-DTU inflight lock to ensure that requests to the same device_id
-    are processed serially (send + wait + consume), preventing response mismatching
-    when multiple threads are sending to the same DTU.
-
-    Args:
-        device_id: Device EUI
-        data_to_send: Hex string to send
-        auth_token: Auth token
-        response_validator: Callable that returns True if uplink is the response for this request
-        timeout_sec: Timeout in seconds
-        fport: LoRaWAN fPort for downlink
-        reference: Reference identifier
-        min_interval_sec: Minimum interval between sends to this DTU
-        poll_interval_sec: Interval between uplink polls
-
-    Returns:
-        tuple: (status, hex_response_string) or (0, None) on timeout/failure
-    """
-    # Acquire per-DTU inflight lock to serialize send+wait for same device
+    # For request/response sensors, send a command and wait for the next matching uplink.
     lock = _get_inflight_lock(device_id)
-    
     with lock:
-        # Send the request
         send_time = time.time()
-        status, response = send_request(
+        status, _ = send_request(
             device_id,
             data_to_send,
             auth_token,
@@ -438,65 +348,193 @@ def send_and_wait(
             min_interval_sec=min_interval_sec,
             timeout=timeout_sec,
         )
-
         if status != 1:
             print(f"[send_and_wait] Failed to send request to {device_id}")
-            return (0, None)
+            return 0, None
 
-        # Poll for response
         deadline = send_time + timeout_sec
         while time.time() < deadline:
             time.sleep(poll_interval_sec)
-
             status, uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
             if status != 1 or uplinks is None:
                 continue
 
-            # Filter uplinks: only after send_time AND after last response timestamp, and pass validator
             for uplink in uplinks:
-                # Re-read last_resp_ts for each uplink to catch updates from other threads
                 with _RESPONSE_TS_LOCK:
                     last_resp_ts = _LAST_RESPONSE_TS.get(device_id, 0.0)
-                
-                if uplink["ts"] <= last_resp_ts:
-                    continue  # Already used this response before
-                if uplink["ts"] < send_time:
-                    continue  # Too old
+
+                if uplink["ts"] <= last_resp_ts or uplink["ts"] < send_time:
+                    continue
 
                 hex_data = uplink["hex"]
                 try:
                     if response_validator(hex_data):
-                        # Mark this response as used (atomic check-and-set)
                         with _RESPONSE_TS_LOCK:
-                            # Double-check: another thread might have used it while we were validating
                             if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
                                 continue
                             _LAST_RESPONSE_TS[device_id] = uplink["ts"]
-                        return (1, hex_data)
+                        return 1, hex_data
                 except Exception as e:
                     print(f"[send_and_wait] Validator error: {e}")
-                    continue
 
         print(f"[send_and_wait] Timeout waiting for response from {device_id}")
-        return (0, None)
+        return 0, None
 
 
-# ==================== Initialize Service Wiring ====================
+def _handle_request(task: Dict[str, Any]):
+    # Dispatch the sensor code to the matching reader and cache the latest result.
+    dev_eui = str(task.get("dev_eui", "")).strip()
+    sensor = str(task.get("sensor", "")).strip()
+    if not dev_eui or not sensor:
+        return
 
-def _initialize_service():
-    """Initialize sensor_service with references to queue and communicator."""
+    dispatch_map: Dict[str, Callable[[str], Dict[str, Any]]] = {
+        "ht": read_ht,
+        "ta": read_ta,
+        "wl": read_wl,
+        "mmwave": read_mmwave,
+    }
+
+    reader = dispatch_map.get(sensor)
+    if reader is None:
+        result = _error_result(f"Unsupported sensor: {sensor}")
+    else:
+        result = reader(dev_eui)
+
+    _write_buffer_result(dev_eui, sensor, result)
+
+
+def read_ht(dev_eui: str) -> Dict[str, Any]:
+    # Request and decode one humidity/temperature sample.
+    profile = HumidityTempSensor()
     try:
-        import sensor_service as ss
-        ss.init(request_queue, __import__(__name__))
-    except ImportError:
-        print("[initialize_service] sensor_service not yet available, will retry later")
+        token = get_token()
+        status, hex_data = send_and_wait(
+            device_id=dev_eui,
+            data_to_send=profile.encode_read_command(),
+            auth_token=token,
+            response_validator=profile.validate_response,
+            timeout_sec=15.0,
+            fport=1,
+            reference="humidity-read",
+            min_interval_sec=1.0,
+            poll_interval_sec=1.0,
+        )
+        if status != 1 or not hex_data:
+            return _error_result("Failed to get response or timeout")
+        decoded = profile.decode_response(hex_data)
+        if not decoded:
+            return _error_result("Failed to decode response")
+        return _result(True, data=decoded)
+    except Exception as e:
+        return _error_result(str(e))
 
 
-# Queue adapter routes each task to its per-device worker
-request_queue = _TaskRouterQueue()
+def read_ta(dev_eui: str) -> Dict[str, Any]:
+    # IMU reads use an unlock step, then separate angle and acceleration requests.
+    profile = HWT901BSensor()
+    try:
+        token = get_token()
+        unlock_cmd = profile.encode_unlock_command()
+        status, _ = send_request(
+            device_id=dev_eui,
+            data_to_send=unlock_cmd,
+            auth_token=token,
+            min_interval_sec=1.0,
+        )
+        if status != 1:
+            return _error_result("Failed to send unlock command")
 
-# Initialize sensor service
-_initialize_service()
+        time.sleep(0.5)
+
+        status, angles_hex = send_and_wait(
+            device_id=dev_eui,
+            data_to_send=profile.encode_read_angles_command(),
+            auth_token=token,
+            response_validator=profile.validate_angles_response,
+            timeout_sec=15.0,
+            fport=1,
+            reference="angles-read",
+            min_interval_sec=1.0,
+            poll_interval_sec=1.0,
+        )
+        if status != 1 or not angles_hex:
+            return _error_result("Failed to read angles")
+
+        status, accel_hex = send_and_wait(
+            device_id=dev_eui,
+            data_to_send=profile.encode_read_accel_command(),
+            auth_token=token,
+            response_validator=profile.validate_accel_response,
+            timeout_sec=15.0,
+            fport=1,
+            reference="accel-read",
+            min_interval_sec=1.0,
+            poll_interval_sec=1.0,
+        )
+        if status != 1 or not accel_hex:
+            return _error_result("Failed to read acceleration")
+
+        angles_data = profile.decode_angles(angles_hex)
+        accel_data = profile.decode_acceleration(accel_hex)
+        if not angles_data:
+            return _error_result("Failed to decode angles")
+        if not accel_data:
+            return _error_result("Failed to decode acceleration")
+
+        combined = {}
+        combined.update(angles_data)
+        combined.update(accel_data)
+        return _result(True, data=combined)
+    except Exception as e:
+        return _error_result(str(e))
 
 
+def read_wl(dev_eui: str) -> Dict[str, Any]:
+    # Request and decode one water level sample.
+    profile = WaterLevelSensor()
+    try:
+        token = get_token()
+        status, hex_data = send_and_wait(
+            device_id=dev_eui,
+            data_to_send=profile.encode_read_command(),
+            auth_token=token,
+            response_validator=profile.validate_response,
+            timeout_sec=15.0,
+            fport=1,
+            reference="water-level-read",
+            min_interval_sec=1.0,
+            poll_interval_sec=1.0,
+        )
+        if status != 1 or not hex_data:
+            return _error_result("Failed to get response or timeout")
+        decoded = profile.decode_response(hex_data)
+        if not decoded:
+            return _error_result("Failed to decode response")
+        return _result(True, data=decoded)
+    except Exception as e:
+        return _error_result(str(e))
 
+
+def read_mmwave(dev_eui: str) -> Dict[str, Any]:
+    # Radar data is uplink-only here, so just pull and decode the latest packet.
+    profile = MMWaveSensor()
+    try:
+        token = get_token()
+        status, hex_data = pull_latest_data(
+            device_id=dev_eui,
+            auth_token=token,
+            size=10,
+        )
+        if status != 1 or not hex_data:
+            return _error_result("Failed to pull latest uplink")
+        targets = profile.decode_targets(hex_data)
+        if not targets:
+            return _error_result("No targets detected or failed to decode")
+        return _result(True, data={"targets": targets})
+    except Exception as e:
+        return _error_result(str(e))
+
+
+# Start background routing as soon as this module is imported.
+start_router()

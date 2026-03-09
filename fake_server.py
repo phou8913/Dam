@@ -20,12 +20,11 @@ import struct
 
 app = Flask(__name__)
 
-# Global storage: device_id -> list of uplinks
-# Each uplink: {"insertTime": iso_string, "data": base64, "fPort": int}
+# In-memory uplink history keyed by device ID.
 device_uplinks: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 uplinks_lock = threading.Lock()
 
-# Simulation config
+# Optional knobs for testing retries and timing behavior.
 SIM_PACKET_LOSS_RATE = 0.0
 SIM_DELAY_SEC = 0.0
 
@@ -132,26 +131,26 @@ def process_downlink(device_id: str, hex_data: str, fport: int):
     """
     cmd = hex_data.replace(" ", "").upper()
     
-    # Humidity/Temp: starts with 0104
+    # Humidity/temperature command family.
     if cmd.startswith("0104"):
         response_hex = generate_fake_humidity_temp_hex()
         store_uplink(device_id, response_hex, fport)
         return
     
-    # Tilt/Acc: starts with 50
+    # Tilt/acceleration command family.
     if cmd.startswith("50"):
-        # Angles: 5003003D00039986
+        # Angle read command.
         if cmd == "5003003D00039986":
             response_hex = generate_fake_angles_hex()
             store_uplink(device_id, response_hex, fport)
-        # Accel: 5003003400034984
+        # Acceleration read command.
         elif cmd == "5003003400034984":
             response_hex = generate_fake_accel_hex()
             store_uplink(device_id, response_hex, fport)
-        # Unlock: 50060069B58822A1 - no response needed
+        # Unlock command does not generate an uplink.
         return
     
-    # Water Level: starts with 7B03 (slave 123, func 03)
+    # Water level command family.
     if cmd.startswith("7B03"):
         response_hex = generate_fake_water_level_hex()
         store_uplink(device_id, response_hex, fport)
@@ -186,7 +185,7 @@ mmwave_thread = threading.Thread(target=generate_mmwave_uplinks_periodically, da
 mmwave_thread.start()
 
 
-# ==================== API Endpoints ====================
+# Public API endpoints matching the real gateway surface.
 
 @app.route('/api/v1/internal/auth', methods=['POST'])
 def authenticate():
@@ -263,6 +262,7 @@ def health():
 
 
 if __name__ == '__main__':
+    # Standalone entry point for local integration testing.
     print("=" * 60)
     print("Fake LoRa Gateway Server")
     print("=" * 60)

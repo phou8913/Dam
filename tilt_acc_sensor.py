@@ -13,6 +13,7 @@ class HWT901BSensor:
     Only handles command byte generation and response decoding.
     """
 
+    # Known command frames for unlocking the sensor and reading two data groups.
     UNLOCK_CMD = "50060069B58822A1"
     READ_ANGLES_CMD = "5003003D00039986"
     READ_ACCEL_CMD = "5003003400034984"
@@ -67,6 +68,7 @@ class HWT901BSensor:
             return None
 
         try:
+            # Raw values map the signed 16-bit range onto +/-180 degrees.
             roll_raw = self._int16_be(data[3:5])
             pitch_raw = self._int16_be(data[5:7])
             yaw_raw = self._int16_be(data[7:9])
@@ -100,6 +102,7 @@ class HWT901BSensor:
             return None
 
         try:
+            # Raw values map the signed 16-bit range onto +/-16 g.
             ax_raw = self._int16_be(data[3:5])
             ay_raw = self._int16_be(data[5:7])
             az_raw = self._int16_be(data[7:9])

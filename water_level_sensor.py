@@ -14,6 +14,7 @@ class WaterLevelSensor:
     Only handles command byte generation and response decoding.
     """
 
+    # Sensor-specific Modbus slave address used by the deployment.
     SLAVE_ADDR = 123
 
     @classmethod
@@ -89,6 +90,7 @@ class WaterLevelSensor:
         data_bytes = data[3:7]
 
         try:
+            # The payload is one big-endian IEEE 754 float in meters.
             level_m = struct.unpack('>f', data_bytes)[0]
 
             return {

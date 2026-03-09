@@ -39,6 +39,7 @@ class MMWaveSensor:
         num_targets = min(data_len // 4, 5)
         targets = {}
 
+        # Each target uses 4 bytes: distance in mm and angle in centidegrees.
         for i in range(num_targets):
             offset = i * 4
             target_bytes = data[offset:offset + 4]

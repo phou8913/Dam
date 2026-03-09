@@ -13,6 +13,7 @@ class HumidityTempSensor:
     Only handles command byte generation and response decoding.
     """
 
+    # Fixed Modbus command used to request temperature, humidity, and dewpoint.
     # Modbus command to read 3 registers: T, H, D
     MODBUS_READ_CMD = "010400000003B00B"
 
@@ -111,6 +112,7 @@ class HumidityTempSensor:
             return None
 
         try:
+            # The payload stores signed temperature/dewpoint and unsigned humidity.
             t_raw = self._int16_be(data_bytes[0:2])
             temperature_c = t_raw / 100.0
 
