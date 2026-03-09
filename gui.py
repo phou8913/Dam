@@ -34,6 +34,13 @@ class SensorDashboard:
         style.theme_use("clam")
 
         self.refresh_interval_ms = 1000
+        self.auto_poll_interval_ms = 5000
+        self.auto_enabled = {
+            "ht": False,
+            "ta": False,
+            "wl": False,
+            "mmwave": False,
+        }
 
         main_container = ttk.Frame(root)
         main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -82,11 +89,20 @@ class SensorDashboard:
         self.ht_raw = ttk.Label(frame, text="--", foreground="gray", wraplength=500)
         self.ht_raw.grid(row=5, column=1, columnspan=2, sticky=tk.W, padx=5)
 
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=6, column=0, columnspan=3, pady=10)
+
         ttk.Button(
-            frame,
+            button_row,
             text="Read Once",
             command=lambda: self.enqueue_request("ht", self.ht_eui_entry),
-        ).grid(row=6, column=0, columnspan=3, pady=10)
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.ht_auto_button = ttk.Button(
+            button_row,
+            text="Start Auto",
+            command=lambda: self.toggle_auto("ht", self.ht_eui_entry, self.ht_auto_button),
+        )
+        self.ht_auto_button.pack(side=tk.LEFT)
 
     def create_tilt_acc_section(self, parent):
         # Tilt and acceleration card for IMU readings.
@@ -127,11 +143,20 @@ class SensorDashboard:
         self.ta_raw = ttk.Label(frame, text="--", foreground="gray", wraplength=500)
         self.ta_raw.grid(row=7, column=1, columnspan=2, sticky=tk.W, padx=5)
 
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=8, column=0, columnspan=3, pady=10)
+
         ttk.Button(
-            frame,
+            button_row,
             text="Read Once",
             command=lambda: self.enqueue_request("ta", self.ta_eui_entry),
-        ).grid(row=8, column=0, columnspan=3, pady=10)
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.ta_auto_button = ttk.Button(
+            button_row,
+            text="Start Auto",
+            command=lambda: self.toggle_auto("ta", self.ta_eui_entry, self.ta_auto_button),
+        )
+        self.ta_auto_button.pack(side=tk.LEFT)
 
     def create_water_level_section(self, parent):
         # Water level card with decoded level and raw frame display.
@@ -156,11 +181,20 @@ class SensorDashboard:
         self.wl_raw = ttk.Label(frame, text="--", foreground="gray", wraplength=500)
         self.wl_raw.grid(row=3, column=1, columnspan=2, sticky=tk.W, padx=5)
 
+        button_row = ttk.Frame(frame)
+        button_row.grid(row=4, column=0, columnspan=3, pady=10)
+
         ttk.Button(
-            frame,
+            button_row,
             text="Read Once",
             command=lambda: self.enqueue_request("wl", self.wl_eui_entry),
-        ).grid(row=4, column=0, columnspan=3, pady=10)
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.wl_auto_button = ttk.Button(
+            button_row,
+            text="Start Auto",
+            command=lambda: self.toggle_auto("wl", self.wl_eui_entry, self.wl_auto_button),
+        )
+        self.wl_auto_button.pack(side=tk.LEFT)
 
     def create_radar_section(self, parent):
         # Radar card combines polar plot and a compact target list.
@@ -192,11 +226,20 @@ class SensorDashboard:
             label.pack(anchor=tk.W, padx=10, pady=2)
             self.target_labels.append(label)
 
+        button_row = ttk.Frame(frame)
+        button_row.pack(pady=10)
+
         ttk.Button(
-            frame,
+            button_row,
             text="Read Once",
             command=lambda: self.enqueue_request("mmwave", self.mmwave_eui_entry),
-        ).pack(pady=10)
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.mmwave_auto_button = ttk.Button(
+            button_row,
+            text="Start Auto",
+            command=lambda: self.toggle_auto("mmwave", self.mmwave_eui_entry, self.mmwave_auto_button),
+        )
+        self.mmwave_auto_button.pack(side=tk.LEFT)
 
     def setup_radar_plot(self):
         # Reset plot styling before drawing the latest targets.
@@ -222,6 +265,21 @@ class SensorDashboard:
         dev_eui = eui_entry.get().strip()
         if dev_eui:
             communicator.enqueue_request(dev_eui, sensor)
+
+    def toggle_auto(self, sensor, eui_entry, button):
+        # Toggle periodic read requests for one sensor panel.
+        self.auto_enabled[sensor] = not self.auto_enabled[sensor]
+        button.config(text="Stop Auto" if self.auto_enabled[sensor] else "Start Auto")
+        if self.auto_enabled[sensor]:
+            self._auto_poll(sensor, eui_entry, button)
+
+    def _auto_poll(self, sensor, eui_entry, button):
+        # Re-enqueue reads until this panel's auto mode is turned off.
+        if not self.auto_enabled.get(sensor):
+            button.config(text="Start Auto")
+            return
+        self.enqueue_request(sensor, eui_entry)
+        self.root.after(self.auto_poll_interval_ms, lambda: self._auto_poll(sensor, eui_entry, button))
 
     def refresh_ui(self):
         # Poll the shared result buffer and refresh every sensor panel.

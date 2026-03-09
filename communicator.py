@@ -18,6 +18,7 @@ from water_level_sensor import WaterLevelSensor
 from mmwave_sensor import MMWaveSensor
 
 
+# Backend mode and connection settings.
 USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
 
 REAL_BASE_URL = "http://99.10.226.29:4560/api"
@@ -30,119 +31,18 @@ def _default_base_url(use_fake_server: bool) -> str:
 
 # Switch the HTTP target depending on whether local simulation is enabled.
 DEFAULT_BASE_URL = _default_base_url(USE_FAKE_SERVER)
+BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
+ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
+PASSWORD = os.getenv("LORA_PASSWORD", "admin")
 
 
-class _Backend:
-    """Unified LoRa API communicator (works with real or fake HTTP server)."""
-
-    BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
-    ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
-    PASSWORD = os.getenv("LORA_PASSWORD", "admin")
-
-    @staticmethod
-    def get_token() -> str:
-        url = f"{_Backend.BASE_URL}/v1/internal/auth"
-        payload = {
-            "account": _Backend.ACCOUNT,
-            "password": _Backend.PASSWORD,
-        }
-        try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            token = response.json().get("token")
-            if not token:
-                raise RuntimeError("Authentication successful but no token received")
-            return token
-        except Exception as e:
-            raise RuntimeError(f"Failed to authenticate: {e}")
-
-    @staticmethod
-    def send_request(
-        device_id: str,
-        data_to_send: str,
-        auth_token: str,
-        fport: int = 1,
-        reference: str = "downlink-cmd",
-    ) -> Tuple[int, Optional[Any]]:
-        try:
-            url = f"{_Backend.BASE_URL}/v1/devices/{device_id}/queue"
-            headers = {
-                "token": auth_token,
-                "content-type": "application/json",
-            }
-            payload = {
-                "confirmed": True,
-                "mode": "hex",
-                "data": data_to_send,
-                "fPort": fport,
-                "reference": reference,
-            }
-            response = requests.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            return 1, response.json()
-        except Exception as e:
-            print(f"Error sending request: {e}")
-            return 0, None
-
-    @staticmethod
-    def pull_latest_uplinks(
-        device_id: str,
-        auth_token: str,
-        size: int = 10,
-    ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-        try:
-            url = f"{_Backend.BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
-            headers = {"token": auth_token}
-            params = {"size": size, "page": 1}
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
-
-            uplinks_raw = response.json().get("result", [])
-            uplinks: List[Dict[str, Any]] = []
-
-            for uplink in uplinks_raw:
-                raw_b64 = uplink.get("data")
-                fport = uplink.get("fPort", 0)
-                ts_str = uplink.get("insertTime")
-                if ts_str:
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                    except Exception as e:
-                        print(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
-                        ts = time.time()
-                else:
-                    ts = time.time()
-
-                if raw_b64 and fport > 0:
-                    try:
-                        raw_bytes = base64.b64decode(raw_b64)
-                        uplinks.append({
-                            "ts": ts,
-                            "fport": fport,
-                            "hex": raw_bytes.hex(),
-                            "raw": uplink,
-                        })
-                    except Exception as e:
-                        print(f"Warning: Failed to decode uplink: {e}")
-
-            if uplinks:
-                return 1, uplinks
-            return 0, None
-        except Exception as e:
-            print(f"Error pulling uplinks: {e}")
-            return 0, None
-
-
-_backend = _Backend()
-
-
-# Shared queues and buffers used by the GUI and worker threads.
+# Shared queues and buffers used across threads.
 request_queue = queue.Queue()
 
 buffer: Dict[str, Dict[str, Dict[str, Any]]] = {}
 buffer_lock = threading.Lock()
 
-# Per-device coordination primitives keep requests ordered and rate-limited.
+# Per-device locks and worker registries.
 _LAST_SEND_TS: Dict[str, float] = {}
 _SEND_LOCKS: Dict[str, threading.Lock] = {}
 _SEND_LOCKS_GUARD = threading.Lock()
@@ -157,6 +57,7 @@ _DEVICE_WORKERS: Dict[str, "_DeviceWorker"] = {}
 _DEVICE_WORKERS_LOCK = threading.Lock()
 
 
+# Standard result wrappers for sensor reads.
 def _result(ok: bool, data: Any = None, error: Optional[str] = None) -> Dict[str, Any]:
     return {
         "ok": ok,
@@ -170,9 +71,11 @@ def _error_result(error: str) -> Dict[str, Any]:
     return _result(False, data=None, error=error)
 
 
+# Backend selection and shared buffer helpers.
+### gui.py uses this to switch between real and fake server
 def configure_backend(mode: str = "real"):
     """Switch communicator traffic between the real gateway and the fake local server."""
-    global USE_FAKE_SERVER, DEFAULT_BASE_URL, _backend
+    global USE_FAKE_SERVER, DEFAULT_BASE_URL, BASE_URL
 
     use_fake_server = mode == "fake"
     USE_FAKE_SERVER = use_fake_server
@@ -183,10 +86,9 @@ def configure_backend(mode: str = "real"):
     else:
         os.environ.pop("USE_FAKE_SERVER", None)
 
-    _Backend.BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
-    _backend = _Backend()
+    BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
 
-
+### gui.py uses this to get the latest result for a given device and sensor.
 def get_buffer_data(dev_eui: str, sensor: str) -> Optional[Dict[str, Any]]:
     with buffer_lock:
         return buffer.get(dev_eui, {}).get(sensor)
@@ -198,7 +100,7 @@ def _write_buffer_result(dev_eui: str, sensor: str, result: Dict[str, Any]):
             buffer[dev_eui] = {}
         buffer[dev_eui][sensor] = result
 
-
+### gui.py uses this to request a new reading for a given device and sensor.
 def enqueue_request(dev_eui: str, sensor: str):
     # The GUI only queues work; device workers do the blocking I/O.
     request_queue.put({
@@ -208,6 +110,7 @@ def enqueue_request(dev_eui: str, sensor: str):
     })
 
 
+# Per-device locking and worker lifecycle.
 def _get_send_lock(dev_eui: str) -> threading.Lock:
     with _SEND_LOCKS_GUARD:
         lock = _SEND_LOCKS.get(dev_eui)
@@ -248,6 +151,30 @@ class _DeviceWorker:
                 _write_buffer_result(self.dev_eui, sensor, _error_result(f"Worker exception: {e}"))
 
 
+# Sensor-specific request handling and decoding.
+def _handle_request(task: Dict[str, Any]):
+    # Dispatch the sensor code to the matching reader and cache the latest result.
+    dev_eui = str(task.get("dev_eui", "")).strip()
+    sensor = str(task.get("sensor", "")).strip()
+    if not dev_eui or not sensor:
+        return
+
+    dispatch_map: Dict[str, Callable[[str], Dict[str, Any]]] = {
+        "ht": read_ht,
+        "ta": read_ta,
+        "wl": read_wl,
+        "mmwave": read_mmwave,
+    }
+
+    reader = dispatch_map.get(sensor)
+    if reader is None:
+        result = _error_result(f"Unsupported sensor: {sensor}")
+    else:
+        result = reader(dev_eui)
+
+    _write_buffer_result(dev_eui, sensor, result)
+
+
 def _get_device_worker(dev_eui: str) -> _DeviceWorker:
     with _DEVICE_WORKERS_LOCK:
         worker = _DEVICE_WORKERS.get(dev_eui)
@@ -257,6 +184,7 @@ def _get_device_worker(dev_eui: str) -> _DeviceWorker:
         return worker
 
 
+# Request routing from the global queue to device workers.
 def _dispatch_request(task: Dict[str, Any]):
     # Route each task to the worker dedicated to that device.
     dev_eui = str(task.get("dev_eui", "")).strip()
@@ -280,8 +208,22 @@ def start_router():
     return thread
 
 
+# HTTP communication helpers for the LoRa backend.
 def get_token() -> str:
-    return _backend.get_token()
+    url = f"{BASE_URL}/v1/internal/auth"
+    payload = {
+        "account": ACCOUNT,
+        "password": PASSWORD,
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        token = response.json().get("token")
+        if not token:
+            raise RuntimeError("Authentication successful but no token received")
+        return token
+    except Exception as e:
+        raise RuntimeError(f"Failed to authenticate: {e}")
 
 
 def send_request(
@@ -302,7 +244,25 @@ def send_request(
         if elapsed < min_interval_sec:
             time.sleep(min_interval_sec - elapsed)
         _LAST_SEND_TS[device_id] = time.time()
-        return _backend.send_request(device_id, data_to_send, auth_token, fport, reference)
+        try:
+            url = f"{BASE_URL}/v1/devices/{device_id}/queue"
+            headers = {
+                "token": auth_token,
+                "content-type": "application/json",
+            }
+            payload = {
+                "confirmed": True,
+                "mode": "hex",
+                "data": data_to_send,
+                "fPort": fport,
+                "reference": reference,
+            }
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            return 1, response.json()
+        except Exception as e:
+            print(f"Error sending request: {e}")
+            return 0, None
 
 
 def pull_latest_uplinks(
@@ -310,18 +270,47 @@ def pull_latest_uplinks(
     auth_token: str,
     size: int = 10,
 ) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
-    return _backend.pull_latest_uplinks(device_id, auth_token, size)
+    try:
+        url = f"{BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
+        headers = {"token": auth_token}
+        params = {"size": size, "page": 1}
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
 
+        uplinks_raw = response.json().get("result", [])
+        uplinks: List[Dict[str, Any]] = []
 
-def pull_latest_data(
-    device_id: str,
-    auth_token: str,
-    size: int = 10,
-) -> Tuple[int, Optional[str]]:
-    status, uplinks = pull_latest_uplinks(device_id, auth_token, size)
-    if status != 1 or not uplinks:
+        for uplink in uplinks_raw:
+            raw_b64 = uplink.get("data")
+            fport = uplink.get("fPort", 0)
+            ts_str = uplink.get("insertTime")
+            if ts_str:
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                except Exception as e:
+                    print(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
+                    ts = time.time()
+            else:
+                ts = time.time()
+
+            if raw_b64 and fport > 0:
+                try:
+                    raw_bytes = base64.b64decode(raw_b64)
+                    uplinks.append({
+                        "ts": ts,
+                        "fport": fport,
+                        "hex": raw_bytes.hex(),
+                        "raw": uplink,
+                    })
+                except Exception as e:
+                    print(f"Warning: Failed to decode uplink: {e}")
+
+        if uplinks:
+            return 1, uplinks
         return 0, None
-    return 1, uplinks[0]["hex"]
+    except Exception as e:
+        print(f"Error pulling uplinks: {e}")
+        return 0, None
 
 
 def send_and_wait(
@@ -379,29 +368,6 @@ def send_and_wait(
 
         print(f"[send_and_wait] Timeout waiting for response from {device_id}")
         return 0, None
-
-
-def _handle_request(task: Dict[str, Any]):
-    # Dispatch the sensor code to the matching reader and cache the latest result.
-    dev_eui = str(task.get("dev_eui", "")).strip()
-    sensor = str(task.get("sensor", "")).strip()
-    if not dev_eui or not sensor:
-        return
-
-    dispatch_map: Dict[str, Callable[[str], Dict[str, Any]]] = {
-        "ht": read_ht,
-        "ta": read_ta,
-        "wl": read_wl,
-        "mmwave": read_mmwave,
-    }
-
-    reader = dispatch_map.get(sensor)
-    if reader is None:
-        result = _error_result(f"Unsupported sensor: {sensor}")
-    else:
-        result = reader(dev_eui)
-
-    _write_buffer_result(dev_eui, sensor, result)
 
 
 def read_ht(dev_eui: str) -> Dict[str, Any]:
@@ -521,13 +487,14 @@ def read_mmwave(dev_eui: str) -> Dict[str, Any]:
     profile = MMWaveSensor()
     try:
         token = get_token()
-        status, hex_data = pull_latest_data(
+        status, uplinks = pull_latest_uplinks(
             device_id=dev_eui,
             auth_token=token,
             size=10,
         )
-        if status != 1 or not hex_data:
+        if status != 1 or not uplinks:
             return _error_result("Failed to pull latest uplink")
+        hex_data = uplinks[0]["hex"]
         targets = profile.decode_targets(hex_data)
         if not targets:
             return _error_result("No targets detected or failed to decode")
@@ -536,5 +503,5 @@ def read_mmwave(dev_eui: str) -> Dict[str, Any]:
         return _error_result(str(e))
 
 
-# Start background routing as soon as this module is imported.
+# Start the background router as soon as this module is imported.
 start_router()
