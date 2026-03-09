@@ -431,87 +431,145 @@ def send_and_wait(
         return 0, None
 
 
+# Run bundled sensor steps that must stay in sequence.
+def _run_bundle(
+    dev_eui: str,
+    auth_token: str,
+    steps: List[Dict[str, Any]],
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    results: Dict[str, Any] = {}
+
+    for step in steps:
+        step_type = step.get("type")
+
+        if step_type == "send_only":
+            status, _ = send_request(
+                device_id=dev_eui,
+                data_to_send=step["command"],
+                auth_token=auth_token,
+                fport=step.get("fport", 1),
+                reference=step.get("reference", "downlink-cmd"),
+                min_interval_sec=step.get("min_interval_sec", 1.0),
+            )
+            if status != 1:
+                return False, results, step.get("send_error", "Failed to send command")
+
+            delay_after_sec = step.get("delay_after_sec", 0.0)
+            if delay_after_sec > 0:
+                time.sleep(delay_after_sec)
+
+            continue
+
+        if step_type == "request_response":
+            status, hex_data = send_and_wait(
+                device_id=dev_eui,
+                data_to_send=step["command"],
+                auth_token=auth_token,
+                response_validator=step["validator"],
+                timeout_sec=step.get("timeout_sec", 15.0),
+                fport=step.get("fport", 1),
+                reference=step.get("reference", "downlink-cmd"),
+                min_interval_sec=step.get("min_interval_sec", 1.0),
+                poll_interval_sec=step.get("poll_interval_sec", 1.0),
+            )
+            if status != 1 or not hex_data:
+                return False, results, step.get("wait_error", "Failed to get response or timeout")
+
+            decoded = step["decoder"](hex_data)
+            if not decoded:
+                return False, results, step.get("decode_error", "Failed to decode response")
+
+            result_key = step.get("result_key")
+            if result_key:
+                results[result_key] = decoded
+
+            delay_after_sec = step.get("delay_after_sec", 0.0)
+            if delay_after_sec > 0:
+                time.sleep(delay_after_sec)
+
+            continue
+
+        return False, results, f"Unsupported bundle step type: {step_type}"
+
+    return True, results, None
+
+
 def read_ht(dev_eui: str) -> Dict[str, Any]:
     # Request and decode one humidity/temperature sample.
     profile = HumidityTempSensor()
     try:
         token = get_token()
-        status, hex_data = send_and_wait(
-            device_id=dev_eui,
-            data_to_send=profile.encode_read_command(),
-            auth_token=token,
-            response_validator=profile.validate_response,
-            timeout_sec=15.0,
-            fport=1,
-            reference="humidity-read",
-            min_interval_sec=1.0,
-            poll_interval_sec=1.0,
-        )
-        if status != 1 or not hex_data:
-            return _error_result("Failed to get response or timeout")
-        decoded = profile.decode_response(hex_data)
-        if not decoded:
-            return _error_result("Failed to decode response")
-        return _result(True, data=decoded)
+        steps = [
+            {
+                "type": "request_response",
+                "command": profile.encode_read_command(),
+                "validator": profile.validate_response,
+                "decoder": profile.decode_response,
+                "reference": "humidity-read",
+                "timeout_sec": 15.0,
+                "min_interval_sec": 1.0,
+                "poll_interval_sec": 1.0,
+                "result_key": "reading",
+                "wait_error": "Failed to get response or timeout",
+                "decode_error": "Failed to decode response",
+            },
+        ]
+        ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
+        if not ok:
+            return _error_result(error or "Bundle failed")
+        return _result(True, data=bundle_results["reading"])
     except Exception as e:
         return _error_result(str(e))
 
 
 def read_ta(dev_eui: str) -> Dict[str, Any]:
-    # IMU reads use an unlock step, then separate angle and acceleration requests.
+    # IMU reads bundle an unlock step with separate angle and acceleration reads.
     profile = HWT901BSensor()
     try:
         token = get_token()
-        unlock_cmd = profile.encode_unlock_command()
-        status, _ = send_request(
-            device_id=dev_eui,
-            data_to_send=unlock_cmd,
-            auth_token=token,
-            min_interval_sec=1.0,
-        )
-        if status != 1:
-            return _error_result("Failed to send unlock command")
-
-        time.sleep(0.5)
-
-        status, angles_hex = send_and_wait(
-            device_id=dev_eui,
-            data_to_send=profile.encode_read_angles_command(),
-            auth_token=token,
-            response_validator=profile.validate_angles_response,
-            timeout_sec=15.0,
-            fport=1,
-            reference="angles-read",
-            min_interval_sec=1.0,
-            poll_interval_sec=1.0,
-        )
-        if status != 1 or not angles_hex:
-            return _error_result("Failed to read angles")
-
-        status, accel_hex = send_and_wait(
-            device_id=dev_eui,
-            data_to_send=profile.encode_read_accel_command(),
-            auth_token=token,
-            response_validator=profile.validate_accel_response,
-            timeout_sec=15.0,
-            fport=1,
-            reference="accel-read",
-            min_interval_sec=1.0,
-            poll_interval_sec=1.0,
-        )
-        if status != 1 or not accel_hex:
-            return _error_result("Failed to read acceleration")
-
-        angles_data = profile.decode_angles(angles_hex)
-        accel_data = profile.decode_acceleration(accel_hex)
-        if not angles_data:
-            return _error_result("Failed to decode angles")
-        if not accel_data:
-            return _error_result("Failed to decode acceleration")
+        steps = [
+            {
+                "type": "send_only",
+                "command": profile.encode_unlock_command(),
+                "reference": "imu-unlock",
+                "min_interval_sec": 1.0,
+                "delay_after_sec": 0.5,
+                "send_error": "Failed to send unlock command",
+            },
+            {
+                "type": "request_response",
+                "command": profile.encode_read_angles_command(),
+                "validator": profile.validate_angles_response,
+                "decoder": profile.decode_angles,
+                "reference": "angles-read",
+                "timeout_sec": 15.0,
+                "min_interval_sec": 1.0,
+                "poll_interval_sec": 1.0,
+                "result_key": "angles",
+                "wait_error": "Failed to read angles",
+                "decode_error": "Failed to decode angles",
+            },
+            {
+                "type": "request_response",
+                "command": profile.encode_read_accel_command(),
+                "validator": profile.validate_accel_response,
+                "decoder": profile.decode_acceleration,
+                "reference": "accel-read",
+                "timeout_sec": 15.0,
+                "min_interval_sec": 1.0,
+                "poll_interval_sec": 1.0,
+                "result_key": "accel",
+                "wait_error": "Failed to read acceleration",
+                "decode_error": "Failed to decode acceleration",
+            },
+        ]
+        ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
+        if not ok:
+            return _error_result(error or "Bundle failed")
 
         combined = {}
-        combined.update(angles_data)
-        combined.update(accel_data)
+        combined.update(bundle_results["angles"])
+        combined.update(bundle_results["accel"])
         return _result(True, data=combined)
     except Exception as e:
         return _error_result(str(e))
@@ -522,23 +580,25 @@ def read_wl(dev_eui: str) -> Dict[str, Any]:
     profile = WaterLevelSensor()
     try:
         token = get_token()
-        status, hex_data = send_and_wait(
-            device_id=dev_eui,
-            data_to_send=profile.encode_read_command(),
-            auth_token=token,
-            response_validator=profile.validate_response,
-            timeout_sec=15.0,
-            fport=1,
-            reference="water-level-read",
-            min_interval_sec=1.0,
-            poll_interval_sec=1.0,
-        )
-        if status != 1 or not hex_data:
-            return _error_result("Failed to get response or timeout")
-        decoded = profile.decode_response(hex_data)
-        if not decoded:
-            return _error_result("Failed to decode response")
-        return _result(True, data=decoded)
+        steps = [
+            {
+                "type": "request_response",
+                "command": profile.encode_read_command(),
+                "validator": profile.validate_response,
+                "decoder": profile.decode_response,
+                "reference": "water-level-read",
+                "timeout_sec": 15.0,
+                "min_interval_sec": 1.0,
+                "poll_interval_sec": 1.0,
+                "result_key": "reading",
+                "wait_error": "Failed to get response or timeout",
+                "decode_error": "Failed to decode response",
+            },
+        ]
+        ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
+        if not ok:
+            return _error_result(error or "Bundle failed")
+        return _result(True, data=bundle_results["reading"])
     except Exception as e:
         return _error_result(str(e))
 
