@@ -9,12 +9,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 try:
-    from .connectivity_common import authenticate, build_reference, choose_base_url, queue_downlink
+    from .connectivity_common import authenticate, build_reference, choose_base_url, classify_target, queue_downlink
     from .client_server_check import ClientServerCheck
     from .dtu_sensor_check import DtuSensorCheck
     from .gateway_dtu_check import GatewayDtuCheck
 except ImportError:
-    from connectivity_common import authenticate, build_reference, choose_base_url, queue_downlink
+    from connectivity_common import authenticate, build_reference, choose_base_url, classify_target, queue_downlink
     from client_server_check import ClientServerCheck
     from dtu_sensor_check import DtuSensorCheck
     from gateway_dtu_check import GatewayDtuCheck
@@ -187,15 +187,26 @@ def _summarize_gateway_dtu(payload: Dict[str, Any]) -> Dict[str, Any]:
         return payload
     ack = payload.get("ack") or {}
     queue = payload.get("queue") or {}
+    mqtt = payload.get("mqtt") or {}
     request_payload = queue.get("request_payload") or {}
     ack_payload = ack.get("payload") or {}
+    failure_phase = None
+    if payload.get("result") == "FAIL":
+        if mqtt and not mqtt.get("ok", True):
+            failure_phase = "mqtt_prepare"
+        elif queue and not queue.get("ok", True):
+            failure_phase = "queue"
+        elif ack and not ack.get("ok", True):
+            failure_phase = "ack"
     return {
         "result": payload.get("result"),
+        "failure_phase": failure_phase,
+        "mqtt_ok": mqtt.get("ok"),
         "queue_ok": queue.get("ok"),
         "ack_ok": ack.get("ok"),
         "acknowledged": ack.get("acknowledged"),
         "reference": payload.get("reference") or request_payload.get("reference") or ack_payload.get("reference"),
-        "ack_topic": payload.get("ack_topic"),
+        "ack_topic": payload.get("ack_topic") or mqtt.get("topic"),
     }
 
 
@@ -230,7 +241,7 @@ def _build_output(
         "result": "PASS" if success else "FAIL",
         "stage": "end_to_end",
         "selected_segments": selected,
-        "target": results.get(selected[0], {}).get("target") if selected else None,
+        "target": classify_target(ctx.base_url),
         "base_url": ctx.base_url,
         "device_id": ctx.device_id,
         "application_id": ctx.application_id,
@@ -337,6 +348,8 @@ def main() -> int:
                 reference=shared_reference,
             )
             if not prepared_gateway.get("ok"):
+                if "client_server" in selected:
+                    results["client_server"] = checks["client_server"].run()
                 results["gateway_dtu"] = {
                     "result": "FAIL",
                     "stage": "gateway_dtu",
