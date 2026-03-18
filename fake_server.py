@@ -13,6 +13,7 @@ from flask import Flask, request, jsonify
 import time
 import random
 import threading
+import os
 from typing import Dict, List, Any
 from collections import defaultdict
 import struct
@@ -23,10 +24,43 @@ app = Flask(__name__)
 # In-memory uplink history keyed by device ID.
 device_uplinks: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 uplinks_lock = threading.Lock()
+device_ack_events: Dict[str, Dict[str, Any]] = {}
+ack_lock = threading.Lock()
 
 # Optional knobs for testing retries and timing behavior.
 SIM_PACKET_LOSS_RATE = 0.0
 SIM_DELAY_SEC = 0.0
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fake_auth_ok() -> bool:
+    return _env_bool("FAKE_AUTH_OK", True)
+
+
+def _fake_queue_ok() -> bool:
+    return _env_bool("FAKE_QUEUE_OK", True)
+
+
+def _fake_ack_enabled() -> bool:
+    return _env_bool("FAKE_ACK_ENABLED", True)
+
+
+def _fake_acknowledged() -> bool:
+    return _env_bool("FAKE_ACKNOWLEDGED", True)
+
+
+def _fake_uplink_enabled() -> bool:
+    return _env_bool("FAKE_UPLINK_ENABLED", True)
+
+
+def _fake_sensor_match() -> str:
+    return os.getenv("FAKE_SENSOR_MATCH", "").strip().lower()
 
 
 def generate_timestamp() -> str:
@@ -124,12 +158,52 @@ def generate_fake_mmwave_hex(max_targets: int = 3) -> str:
     return payload.hex()
 
 
+def _build_ack_event(device_id: str, reference: str) -> Dict[str, Any]:
+    return {
+        "applicationID": "18",
+        "applicationName": "DTU_WaterLevel_Meilun",
+        "deviceName": f"FAKE_{device_id}",
+        "devEUI": device_id,
+        "acknowledged": _fake_acknowledged(),
+        "reference": reference,
+        "fCnt": int(time.time()),
+        "insertTime": generate_timestamp(),
+    }
+
+
+def store_ack_event(device_id: str, reference: str):
+    with ack_lock:
+        device_ack_events[device_id] = _build_ack_event(device_id, reference)
+
+
+def _sensor_response_hex_for_mode(mode: str) -> str | None:
+    if mode == "ht":
+        return generate_fake_humidity_temp_hex()
+    if mode == "ta":
+        return generate_fake_angles_hex()
+    if mode == "ta_accel":
+        return generate_fake_accel_hex()
+    if mode == "wl":
+        return generate_fake_water_level_hex()
+    if mode == "mmwave":
+        return generate_fake_mmwave_hex(max_targets=3)
+    return None
+
+
 def process_downlink(device_id: str, hex_data: str, fport: int):
     """
     Process downlink command and generate appropriate uplink response.
     Routes to correct sensor profile based on command pattern.
     """
+    if not _fake_uplink_enabled():
+        return
+
     cmd = hex_data.replace(" ", "").upper()
+    forced_sensor = _fake_sensor_match()
+    forced_response = _sensor_response_hex_for_mode(forced_sensor)
+    if forced_response is not None:
+        store_uplink(device_id, forced_response, fport)
+        return
     
     # Humidity/temperature command family.
     if cmd.startswith("0104"):
@@ -175,6 +249,8 @@ def generate_mmwave_uplinks_periodically():
     MMWAVE_EUI = "8695311001412450"
     while True:
         time.sleep(1.0)  # Every 1 second
+        if not _fake_uplink_enabled():
+            continue
         if random.random() < 0.8:  # 80% chance to generate
             response_hex = generate_fake_mmwave_hex(max_targets=3)
             store_uplink(MMWAVE_EUI, response_hex, fport=1)
@@ -193,6 +269,9 @@ def authenticate():
     data = request.get_json()
     account = data.get('account')
     password = data.get('password')
+
+    if not _fake_auth_ok():
+        return jsonify({"error": "Forced auth failure"}), 401
     
     # Accept any credentials for testing
     if account and password:
@@ -210,6 +289,9 @@ def send_downlink(device_id: str):
     hex_data = data.get('data', '')
     fport = data.get('fPort', 1)
     reference = data.get('reference', '')
+
+    if not _fake_queue_ok():
+        return jsonify({"status": "forced_queue_failure"}), 500
     
     # Simulate packet loss
     if random.random() < SIM_PACKET_LOSS_RATE:
@@ -224,12 +306,31 @@ def send_downlink(device_id: str):
         threading.Thread(target=delayed, daemon=True).start()
     else:
         process_downlink(device_id, hex_data, fport)
+
+    if _fake_ack_enabled():
+        if SIM_DELAY_SEC > 0 and random.random() < 0.3:
+            def delayed_ack():
+                time.sleep(SIM_DELAY_SEC)
+                store_ack_event(device_id, reference)
+            threading.Thread(target=delayed_ack, daemon=True).start()
+        else:
+            store_ack_event(device_id, reference)
     
     return jsonify({
         "status": "success",
         "device_id": device_id,
         "reference": reference
     }), 200
+
+
+@app.route('/api/v1/devices/<device_id>/ack', methods=['GET'])
+def get_ack(device_id: str):
+    """Retrieve the latest fake ack result for a device."""
+    with ack_lock:
+        ack_event = device_ack_events.get(device_id)
+    if ack_event is None:
+        return jsonify({"error": "Ack not found"}), 404
+    return jsonify(ack_event), 200
 
 
 @app.route('/api/v1/uplink-storage/devices/<device_id>/uplink', methods=['GET'])
@@ -272,6 +373,7 @@ if __name__ == '__main__':
     print("\nEndpoints:")
     print("  POST /api/v1/internal/auth")
     print("  POST /api/v1/devices/<device_id>/queue")
+    print("  GET  /api/v1/devices/<device_id>/ack")
     print("  GET  /api/v1/uplink-storage/devices/<device_id>/uplink")
     print("  GET  /health")
     print("=" * 60)
