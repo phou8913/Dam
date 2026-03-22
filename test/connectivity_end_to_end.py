@@ -6,20 +6,12 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-try:
-    from .connectivity_common import authenticate, build_reference, choose_base_url, classify_target, queue_downlink
-    from .client_server_check import ClientServerCheck
-    from .dtu_sensor_check import DtuSensorCheck
-    from .gateway_dtu_check import GatewayDtuCheck
-except ImportError:
-    from connectivity_common import authenticate, build_reference, choose_base_url, classify_target, queue_downlink
-    from client_server_check import ClientServerCheck
-    from dtu_sensor_check import DtuSensorCheck
-    from gateway_dtu_check import GatewayDtuCheck
-
-SEGMENT_ORDER = ["client_server", "gateway_dtu", "dtu_sensor"]
+from connectivity_common import authenticate, build_reference, choose_base_url, classify_target, queue_downlink
+from client_server_check import ClientServerCheck
+from dtu_sensor_check import DtuSensorCheck
+from gateway_dtu_check import GatewayDtuCheck
 
 DEFAULT_BASE_URL = choose_base_url()
 DEFAULT_ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
@@ -55,9 +47,7 @@ class SegmentContext:
     uplink_page_size: int
     request_data_hex: str
     request_fport: int
-    client_reference: str
-    gateway_reference: str
-    sensor_reference: str
+    reference: str
     mqtt_host: str
     mqtt_port: int
     mqtt_username: str
@@ -75,7 +65,7 @@ FAULT_LABELS = {
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run connectivity checks with one orchestrator entrypoint")
+    parser = argparse.ArgumentParser(description="Run the full end-to-end connectivity check")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--account", default=DEFAULT_ACCOUNT)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
@@ -90,9 +80,7 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--request-data-hex", default="010400000003B00B")
     parser.add_argument("--request-fport", type=int, default=1)
-    parser.add_argument("--client-reference", default="connectivity-test")
-    parser.add_argument("--gateway-reference", default="")
-    parser.add_argument("--sensor-reference", default="")
+    parser.add_argument("--reference", default="")
 
     parser.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
     parser.add_argument("--mqtt-port", type=int, default=int(DEFAULT_MQTT_PORT))
@@ -102,18 +90,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mqtt-keepalive", type=int, default=int(DEFAULT_MQTT_KEEPALIVE))
     parser.add_argument("--mqtt-tls", action="store_true")
 
-    parser.add_argument(
-        "--only",
-        choices=["all", *SEGMENT_ORDER],
-        default="all",
-        help="Run all segments or only one selected segment.",
-    )
-    parser.add_argument(
-        "--from-step",
-        choices=SEGMENT_ORDER,
-        default="client_server",
-        help="Start from a later segment when you only want to rerun downstream checks.",
-    )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -137,9 +113,7 @@ def _build_context(args: argparse.Namespace) -> SegmentContext:
         uplink_page_size=args.uplink_page_size,
         request_data_hex=args.request_data_hex,
         request_fport=args.request_fport,
-        client_reference=args.client_reference,
-        gateway_reference=args.gateway_reference,
-        sensor_reference=args.sensor_reference,
+        reference=args.reference,
         mqtt_host=args.mqtt_host,
         mqtt_port=args.mqtt_port,
         mqtt_username=args.mqtt_username,
@@ -148,13 +122,6 @@ def _build_context(args: argparse.Namespace) -> SegmentContext:
         mqtt_keepalive=args.mqtt_keepalive,
         mqtt_tls=args.mqtt_tls,
     )
-
-
-def _selected_segments(args: argparse.Namespace) -> List[str]:
-    if args.only != "all":
-        return [args.only]
-    start_index = SEGMENT_ORDER.index(args.from_step)
-    return SEGMENT_ORDER[start_index:]
 
 
 def _infer_fault_location(results: Dict[str, Dict[str, Any]]) -> str:
@@ -167,69 +134,9 @@ def _infer_fault_location(results: Dict[str, Dict[str, Any]]) -> str:
     return "none"
 
 
-def _summarize_client_server(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if payload.get("result") == "NOT_RUN":
-        return payload
-    queue = payload.get("queue") or {}
-    request_payload = queue.get("request_payload") or {}
-    return {
-        "result": payload.get("result"),
-        "queue_ok": queue.get("ok"),
-        "status_code": queue.get("status_code"),
-        "reference": request_payload.get("reference"),
-        "data_hex": request_payload.get("data"),
-        "fport": request_payload.get("fPort"),
-    }
-
-
-def _summarize_gateway_dtu(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if payload.get("result") == "NOT_RUN":
-        return payload
-    ack = payload.get("ack") or {}
-    queue = payload.get("queue") or {}
-    mqtt = payload.get("mqtt") or {}
-    request_payload = queue.get("request_payload") or {}
-    ack_payload = ack.get("payload") or {}
-    failure_phase = None
-    if payload.get("result") == "FAIL":
-        if mqtt and not mqtt.get("ok", True):
-            failure_phase = "mqtt_prepare"
-        elif queue and not queue.get("ok", True):
-            failure_phase = "queue"
-        elif ack and not ack.get("ok", True):
-            failure_phase = "ack"
-    return {
-        "result": payload.get("result"),
-        "failure_phase": failure_phase,
-        "mqtt_ok": mqtt.get("ok"),
-        "queue_ok": queue.get("ok"),
-        "ack_ok": ack.get("ok"),
-        "acknowledged": ack.get("acknowledged"),
-        "reference": payload.get("reference") or request_payload.get("reference") or ack_payload.get("reference"),
-        "ack_topic": payload.get("ack_topic") or mqtt.get("topic"),
-    }
-
-
-def _summarize_dtu_sensor(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if payload.get("result") == "NOT_RUN":
-        return payload
-    uplink = payload.get("uplink") or {}
-    matched = uplink.get("matched") or {}
-    return {
-        "result": payload.get("result"),
-        "mode": payload.get("mode"),
-        "matcher": payload.get("matcher"),
-        "reference": payload.get("reference"),
-        "uplink_ok": uplink.get("ok"),
-        "matched_hex": matched.get("hex"),
-        "matched_insert_time": matched.get("insert_time"),
-    }
-
-
 def _build_output(
     *,
     success: bool,
-    selected: List[str],
     inferred: str,
     failed_segment: str | None,
     ctx: SegmentContext,
@@ -240,7 +147,7 @@ def _build_output(
     output = {
         "result": "PASS" if success else "FAIL",
         "stage": "end_to_end",
-        "selected_segments": selected,
+        "selected_segments": ["client_server", "gateway_dtu", "dtu_sensor"],
         "target": classify_target(ctx.base_url),
         "base_url": ctx.base_url,
         "device_id": ctx.device_id,
@@ -261,241 +168,223 @@ def _build_output(
         output["dtu_sensor"] = results["dtu_sensor"]
         return output
 
-    output["client_server"] = _summarize_client_server(results["client_server"])
-    output["gateway_dtu"] = _summarize_gateway_dtu(results["gateway_dtu"])
-    output["dtu_sensor"] = _summarize_dtu_sensor(results["dtu_sensor"])
+    output["client_server"] = ClientServerCheck.summarize(results["client_server"])
+    output["gateway_dtu"] = GatewayDtuCheck.summarize(results["gateway_dtu"])
+    output["dtu_sensor"] = DtuSensorCheck.summarize(results["dtu_sensor"])
     return output
 
 
-def _choose_shared_reference(ctx: SegmentContext) -> str:
-    return (
-        ctx.gateway_reference
-        or ctx.sensor_reference
-        or ctx.client_reference
-        or build_reference("connectivity-test")
+def _emit_output(
+    *,
+    success: bool,
+    failed_segment: str | None,
+    ctx: SegmentContext,
+    shared_auth_result: Dict[str, Any],
+    results: Dict[str, Dict[str, Any]],
+    verbose: bool,
+) -> int:
+    output = _build_output(
+        success=success,
+        inferred=_infer_fault_location(results),
+        failed_segment=failed_segment,
+        ctx=ctx,
+        shared_auth_result=shared_auth_result,
+        results=results,
+        verbose=verbose,
     )
+    print(json.dumps(output, indent=2))
+    return 0 if success else 1
+
+
+def _client_server_auth_fail(ctx: SegmentContext, auth_result: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "result": "FAIL",
+        "stage": "client_server",
+        "target": classify_target(ctx.base_url),
+        "base_url": ctx.base_url,
+        "device_id": ctx.device_id,
+        "auth": auth_result,
+    }
 
 
 def main() -> int:
     args = _parse_args()
     ctx = _build_context(args)
     shared_auth_result = authenticate(ctx.base_url, ctx.account, ctx.password, ctx.auth_timeout)
-    checks = {
-        "client_server": ClientServerCheck(
-            base_url=ctx.base_url,
-            account=ctx.account,
-            password=ctx.password,
-            device_id=ctx.device_id,
-            data_hex=ctx.request_data_hex,
-            fport=ctx.request_fport,
-            reference=ctx.client_reference,
-            auth_timeout=ctx.auth_timeout,
-            queue_timeout=ctx.queue_timeout,
-            shared_auth_result=shared_auth_result,
-        ),
-        "gateway_dtu": GatewayDtuCheck(
-            base_url=ctx.base_url,
-            account=ctx.account,
-            password=ctx.password,
-            device_id=ctx.device_id,
-            application_id=ctx.application_id,
-            data_hex=ctx.request_data_hex,
-            fport=ctx.request_fport,
-            reference=ctx.gateway_reference,
-            auth_timeout=ctx.auth_timeout,
-            queue_timeout=ctx.queue_timeout,
-            ack_timeout=ctx.ack_timeout,
-            mqtt_host=ctx.mqtt_host,
-            mqtt_port=ctx.mqtt_port,
-            mqtt_username=ctx.mqtt_username,
-            mqtt_password=ctx.mqtt_password,
-            mqtt_client_id=ctx.mqtt_client_id,
-            mqtt_keepalive=ctx.mqtt_keepalive,
-            mqtt_tls=ctx.mqtt_tls,
-            shared_auth_result=shared_auth_result,
-        ),
-        "dtu_sensor": DtuSensorCheck(
-            base_url=ctx.base_url,
-            account=ctx.account,
-            password=ctx.password,
-            device_id=ctx.device_id,
-            data_hex=ctx.request_data_hex,
-            fport=ctx.request_fport,
-            reference=ctx.sensor_reference,
-            auth_timeout=ctx.auth_timeout,
-            queue_timeout=ctx.queue_timeout,
-            uplink_timeout=ctx.uplink_timeout,
-            poll_interval=ctx.poll_interval,
-            uplink_page_size=ctx.uplink_page_size,
-            shared_auth_result=shared_auth_result,
-        ),
+    shared_reference = ctx.reference or build_reference("connectivity-test")
+    common_kwargs = {
+        "base_url": ctx.base_url,
+        "account": ctx.account,
+        "password": ctx.password,
+        "device_id": ctx.device_id,
+        "data_hex": ctx.request_data_hex,
+        "fport": ctx.request_fport,
+        "reference": shared_reference,
+        "auth_timeout": ctx.auth_timeout,
+        "queue_timeout": ctx.queue_timeout,
+        "shared_auth_result": shared_auth_result,
     }
-    selected = _selected_segments(args)
+    client_check = ClientServerCheck(
+        **common_kwargs,
+    )
+    gateway_check = GatewayDtuCheck(
+        **common_kwargs,
+        application_id=ctx.application_id,
+        ack_timeout=ctx.ack_timeout,
+        mqtt_host=ctx.mqtt_host,
+        mqtt_port=ctx.mqtt_port,
+        mqtt_username=ctx.mqtt_username,
+        mqtt_password=ctx.mqtt_password,
+        mqtt_client_id=ctx.mqtt_client_id,
+        mqtt_keepalive=ctx.mqtt_keepalive,
+        mqtt_tls=ctx.mqtt_tls,
+    )
+    sensor_check = DtuSensorCheck(
+        **common_kwargs,
+        uplink_timeout=ctx.uplink_timeout,
+        poll_interval=ctx.poll_interval,
+        uplink_page_size=ctx.uplink_page_size,
+    )
     results: Dict[str, Dict[str, Any]] = {
-        "client_server": _not_run("Skipped by selection"),
-        "gateway_dtu": _not_run("Skipped by selection"),
-        "dtu_sensor": _not_run("Skipped by selection"),
+        "client_server": _not_run("Not reached yet"),
+        "gateway_dtu": _not_run("Not reached yet"),
+        "dtu_sensor": _not_run("Not reached yet"),
     }
 
-    if shared_auth_result.get("ok") and ctx.request_data_hex:
-        shared_reference = _choose_shared_reference(ctx)
-        prepared_gateway = None
-        prepared_sensor = None
-
-        if "gateway_dtu" in selected:
-            prepared_gateway = checks["gateway_dtu"].prepare_ack_monitor(
-                auth_result=shared_auth_result,
-                reference=shared_reference,
-            )
-            if not prepared_gateway.get("ok"):
-                if "client_server" in selected:
-                    results["client_server"] = checks["client_server"].run()
-                results["gateway_dtu"] = {
-                    "result": "FAIL",
-                    "stage": "gateway_dtu",
-                    "base_url": ctx.base_url,
-                    "application_id": ctx.application_id,
-                    "device_id": ctx.device_id,
-                    "auth": {
-                        "ok": True,
-                        "status_code": shared_auth_result.get("status_code"),
-                        "elapsed_ms": shared_auth_result.get("elapsed_ms"),
-                    },
-                    "mqtt": prepared_gateway.get("mqtt_result"),
-                }
-                started = False
-                for downstream in selected:
-                    if downstream == "gateway_dtu":
-                        started = True
-                        continue
-                    if started:
-                        results[downstream] = _not_run("Skipped because server/platform -> gateway -> dtu failed")
-                output = _build_output(
-                    success=False,
-                    selected=selected,
-                    inferred=FAULT_LABELS["gateway_dtu"],
-                    failed_segment=FAULT_LABELS["gateway_dtu"],
-                    ctx=ctx,
-                    shared_auth_result=shared_auth_result,
-                    results=results,
-                    verbose=args.verbose,
-                )
-                print(json.dumps(output, indent=2))
-                return 1
-
-        if "dtu_sensor" in selected:
-            prepared_sensor = checks["dtu_sensor"].capture_baseline(
-                auth_result=shared_auth_result,
-                reference=shared_reference,
-            )
-
-        trigger_start_ts = time.time()
-        shared_queue_result = queue_downlink(
-            ctx.base_url,
-            ctx.device_id,
-            shared_auth_result["token"],
-            ctx.request_data_hex,
-            ctx.request_fport,
-            shared_reference,
-            ctx.queue_timeout,
-        )
-
-        for name in selected:
-            if name == "client_server":
-                payload = checks["client_server"].build_result(
-                    shared_auth_result,
-                    shared_queue_result,
-                    shared_reference,
-                )
-            elif name == "gateway_dtu":
-                payload = checks["gateway_dtu"].finalize_with_queue(
-                    prepared_gateway,
-                    shared_queue_result,
-                )
-            else:
-                payload = checks["dtu_sensor"].finalize_with_queue(
-                    prepared_sensor,
-                    shared_queue_result,
-                    trigger_start_ts,
-                )
-
-            results[name] = payload
-            if payload.get("result") != "PASS":
-                if name == "client_server" and prepared_gateway and prepared_gateway.get("listener") is not None:
-                    prepared_gateway["listener"].stop()
-                started = False
-                for downstream in selected:
-                    if downstream == name:
-                        started = True
-                        continue
-                    if started:
-                        results[downstream] = _not_run(f"Skipped because {FAULT_LABELS[name]} failed")
-                output = _build_output(
-                    success=False,
-                    selected=selected,
-                    inferred=FAULT_LABELS[name],
-                    failed_segment=FAULT_LABELS[name],
-                    ctx=ctx,
-                    shared_auth_result=shared_auth_result,
-                    results=results,
-                    verbose=args.verbose,
-                )
-                print(json.dumps(output, indent=2))
-                return 1
-
-        inferred = _infer_fault_location(results)
-        output = _build_output(
-            success=True,
-            selected=selected,
-            inferred=inferred,
-            failed_segment=None,
+    # 1. Stop immediately if authentication fails.
+    if not shared_auth_result.get("ok"):
+        results["client_server"] = _client_server_auth_fail(ctx, shared_auth_result)
+        results["gateway_dtu"] = _not_run("Skipped because client -> server authentication failed")
+        results["dtu_sensor"] = _not_run("Skipped because client -> server authentication failed")
+        return _emit_output(
+            success=False,
+            failed_segment=FAULT_LABELS["client_server"],
             ctx=ctx,
             shared_auth_result=shared_auth_result,
             results=results,
             verbose=args.verbose,
         )
-        print(json.dumps(output, indent=2))
-        return 0
 
-    for name in selected:
-        payload = checks[name].run()
-        results[name] = payload
-        if payload.get("result") != "PASS":
-            # Short-circuit downstream work once a segment fails.
-            started = False
-            for downstream in selected:
-                if downstream == name:
-                    started = True
-                    continue
-                if started:
-                    results[downstream] = _not_run(f"Skipped because {FAULT_LABELS[name]} failed")
-            output = _build_output(
-                success=False,
-                selected=selected,
-                inferred=FAULT_LABELS[name],
-                failed_segment=FAULT_LABELS[name],
-                ctx=ctx,
-                shared_auth_result=shared_auth_result,
-                results=results,
-                verbose=args.verbose,
-            )
-            print(json.dumps(output, indent=2))
-            return 1
+    # 2. Stop if there is no downlink payload to send.
+    if not ctx.request_data_hex:
+        results["client_server"] = {
+            "result": "FAIL",
+            "stage": "client_server",
+            "target": classify_target(ctx.base_url),
+            "base_url": ctx.base_url,
+            "device_id": ctx.device_id,
+            "reason": "request_data_hex is required for the full end-to-end check",
+        }
+        results["gateway_dtu"] = _not_run("Skipped because request_data_hex is empty")
+        results["dtu_sensor"] = _not_run("Skipped because request_data_hex is empty")
+        return _emit_output(
+            success=False,
+            failed_segment=FAULT_LABELS["client_server"],
+            ctx=ctx,
+            shared_auth_result=shared_auth_result,
+            results=results,
+            verbose=args.verbose,
+        )
 
-    inferred = _infer_fault_location(results)
-    success = all(results[name].get("result") == "PASS" for name in selected)
-    output = _build_output(
-        success=success,
-        selected=selected,
-        inferred=inferred,
-        failed_segment=None if success else inferred,
+    # 3. Prepare the ACK listener before sending the shared request.
+    prepared_gateway = gateway_check.prepare_ack_monitor(
+        auth_result=shared_auth_result,
+        reference=shared_reference,
+    )
+    if not prepared_gateway.get("ok"):
+        results["client_server"] = _not_run("Stopped before queue submission")
+        results["gateway_dtu"] = {
+            "result": "FAIL",
+            "stage": "gateway_dtu",
+            "base_url": ctx.base_url,
+            "application_id": ctx.application_id,
+            "device_id": ctx.device_id,
+            "auth": {
+                "ok": True,
+                "status_code": shared_auth_result.get("status_code"),
+                "elapsed_ms": shared_auth_result.get("elapsed_ms"),
+            },
+            "mqtt": prepared_gateway.get("mqtt_result"),
+        }
+        results["dtu_sensor"] = _not_run("Skipped because server/platform -> gateway -> dtu failed")
+        return _emit_output(
+            success=False,
+            failed_segment=FAULT_LABELS["gateway_dtu"],
+            ctx=ctx,
+            shared_auth_result=shared_auth_result,
+            results=results,
+            verbose=args.verbose,
+        )
+
+    # 4. Capture the current uplink state before sending the shared request.
+    prepared_sensor = sensor_check.prepare_uplink_check(
+        auth_result=shared_auth_result,
+        reference=shared_reference,
+    )
+    trigger_start_ts = time.time()
+
+    # 5. Send one shared downlink request for the whole end-to-end check.
+    shared_queue_result = queue_downlink(
+        ctx.base_url,
+        ctx.device_id,
+        shared_auth_result["token"],
+        ctx.request_data_hex,
+        ctx.request_fport,
+        shared_reference,
+        ctx.queue_timeout,
+    )
+
+    # 6. Build the client -> server result from the shared queue response.
+    results["client_server"] = client_check.finalize_with_queue(
+        shared_auth_result,
+        shared_queue_result,
+        shared_reference,
+    )
+    if results["client_server"].get("result") != "PASS":
+        listener = prepared_gateway.get("listener")
+        if listener is not None:
+            listener.stop()
+        results["gateway_dtu"] = _not_run("Skipped because client -> server failed")
+        results["dtu_sensor"] = _not_run("Skipped because client -> server failed")
+        return _emit_output(
+            success=False,
+            failed_segment=FAULT_LABELS["client_server"],
+            ctx=ctx,
+            shared_auth_result=shared_auth_result,
+            results=results,
+            verbose=args.verbose,
+        )
+
+    # 7. Finalize the gateway -> DTU result using the ACK outcome.
+    results["gateway_dtu"] = gateway_check.finalize_with_queue(
+        prepared_gateway,
+        shared_queue_result,
+    )
+    if results["gateway_dtu"].get("result") != "PASS":
+        results["dtu_sensor"] = _not_run("Skipped because server/platform -> gateway -> dtu failed")
+        return _emit_output(
+            success=False,
+            failed_segment=FAULT_LABELS["gateway_dtu"],
+            ctx=ctx,
+            shared_auth_result=shared_auth_result,
+            results=results,
+            verbose=args.verbose,
+        )
+
+    # 8. Finalize the DTU -> sensor result using the observed uplinks.
+    results["dtu_sensor"] = sensor_check.finalize_with_queue(
+        prepared_sensor,
+        shared_queue_result,
+        trigger_start_ts,
+    )
+    return _emit_output(
+        success=results["dtu_sensor"].get("result") == "PASS",
+        failed_segment=None if results["dtu_sensor"].get("result") == "PASS" else FAULT_LABELS["dtu_sensor"],
         ctx=ctx,
         shared_auth_result=shared_auth_result,
         results=results,
         verbose=args.verbose,
     )
-    print(json.dumps(output, indent=2))
-    return 0 if success else 1
 
 
 if __name__ == "__main__":

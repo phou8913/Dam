@@ -4,30 +4,40 @@ This document defines 6 test cases for validating end-to-end connectivity. The c
 
 ## Architecture Overview
 
-This test framework is organized around three check classes and one main orchestrator script.
+This test framework is organized around three check classes and one main orchestrator script. The end-to-end entrypoint now runs the full three-segment flow only.
 
 - `client_server_check.py`
   - Contains `ClientServerCheck`
-  - Verifies the `client -> server` segment by checking authentication and queue submission
+  - Formats the `client -> server` segment result from the shared auth and shared queue response
 
 - `gateway_dtu_check.py`
   - Contains `GatewayDtuCheck`
-  - Verifies the `gateway -> dtu` segment by checking whether a downlink request can produce a valid ACK result
+  - Prepares ACK monitoring and then verifies whether the shared downlink request produces a valid ACK result
 
 - `dtu_sensor_check.py`
   - Contains `DtuSensorCheck`
-  - Verifies the `dtu -> sensor` segment by checking whether a fresh uplink is observed after the request
+  - Captures the baseline uplink state and then verifies whether a fresh matching uplink appears after the shared request
 
 - `connectivity_end_to_end.py`
   - Acts as the main test entrypoint
-  - Reuses one authentication result and one shared request when possible
-  - Runs the three segments in order
+  - Reuses one authentication result, one shared request, and one shared reference
+  - Always runs the three segments in order
   - Stops early when an upstream segment fails
   - Produces a summarized result that indicates the most likely fault location
 
 ## 0. Base Environment
-- **Main command**: `python .\test\connectivity_end_to_end.py`
+- **Working directory**: `test`
+- **Main command**: `python connectivity_end_to_end.py`
 - **Shell**: PowerShell
+
+## 0.1 Shared Request Model
+
+The end-to-end flow sends one shared downlink request for the whole test.
+
+- A single shared `reference` is used for all three segments
+- `client_server` uses the shared queue result to build segment 1
+- `gateway_dtu` prepares ACK monitoring before the request is sent
+- `dtu_sensor` captures the uplink baseline before the request is sent
 
 ---
 
@@ -138,6 +148,5 @@ This test framework is organized around three check classes and one main orchest
   - Segment 3: **FAIL**
   - **Fault location**: `dtu -> sensor`
 <img width="1092" height="1040" alt="image" src="https://github.com/user-attachments/assets/6d332f24-2795-48c0-ad8b-d4d3a790277e" />
-
 
 

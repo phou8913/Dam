@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,24 +19,107 @@ from mmwave_sensor import MMWaveSensor
 from tilt_acc_sensor import HWT901BSensor
 from water_level_sensor import WaterLevelSensor
 
-try:
-    from .connectivity_common import (
-        authenticate,
-        build_reference,
-        classify_target,
-        pull_latest_uplinks,
-        queue_downlink,
-    )
-except ImportError:
-    from connectivity_common import (
-        authenticate,
-        build_reference,
-        classify_target,
-        pull_latest_uplinks,
-        queue_downlink,
+from connectivity_common import (
+    build_reference,
+    classify_target,
+    result_payload,
+)
+
+
+# Parse the uplink timestamp into a comparable float value.
+def _parse_insert_time(ts_str: str | None) -> float:
+    if not ts_str:
+        return time.time()
+
+    try:
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return time.time()
+
+
+# Pull recent uplinks and normalize the fields used by this check.
+def pull_latest_uplinks(
+    base_url: str,
+    device_id: str,
+    token: str,
+    size: int = 10,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    import requests
+
+    url = f"{base_url}/v1/uplink-storage/devices/{device_id}/uplink"
+    headers = {"token": token}
+    params = {"size": size, "page": 1}
+
+    started = time.time()
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=timeout)
+        elapsed_ms = round((time.time() - started) * 1000, 2)
+    except requests.RequestException as exc:
+        return result_payload(
+            False,
+            "uplink",
+            error_type="NETWORK_FAIL",
+            error_message=str(exc),
+            url=url,
+            params=params,
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if not response.ok:
+        return result_payload(
+            False,
+            "uplink",
+            error_type="HTTP_FAIL",
+            error_message="Failed to query uplinks",
+            url=url,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+            params=params,
+            response_body=body if body is not None else response.text,
+        )
+
+    uplinks_raw = body.get("result", []) if isinstance(body, dict) else []
+    parsed_uplinks: list[dict[str, Any]] = []
+
+    for uplink in uplinks_raw:
+        raw_b64 = uplink.get("data")
+        fport = uplink.get("fPort", 0)
+        ts_str = uplink.get("insertTime")
+        ts = _parse_insert_time(ts_str)
+        decoded_hex = None
+
+        if raw_b64:
+            try:
+                decoded_hex = base64.b64decode(raw_b64).hex()
+            except Exception:
+                decoded_hex = None
+
+        parsed_uplinks.append(
+            {
+                "ts": ts,
+                "fport": fport,
+                "hex": decoded_hex,
+                "raw": uplink,
+            }
+        )
+
+    return result_payload(
+        True,
+        "uplink",
+        url=url,
+        status_code=response.status_code,
+        elapsed_ms=elapsed_ms,
+        params=params,
+        uplinks=parsed_uplinks,
     )
 
 
+# Small helpers for baseline tracking and compact result formatting.
 def _latest_seen_ts(uplink_result: dict[str, Any]) -> float:
     if not uplink_result.get("ok"):
         return time.time()
@@ -44,7 +129,8 @@ def _latest_seen_ts(uplink_result: dict[str, Any]) -> float:
     return max(uplink.get("ts", 0.0) for uplink in uplinks)
 
 
-def _summarize_uplink(uplink: dict[str, Any] | None) -> dict[str, Any] | None:
+    # Summarize one uplink record.
+def _summarize_one_uplink(uplink: dict[str, Any] | None) -> dict[str, Any] | None:
     if not uplink:
         return None
     raw = uplink.get("raw") or {}
@@ -57,18 +143,20 @@ def _summarize_uplink(uplink: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
-def _summarize_uplink_result(uplink_result: dict[str, Any]) -> dict[str, Any]:
+    # Summarize one uplink query result, including the latest uplink.
+def _summarize_uplink_query(uplink_result: dict[str, Any]) -> dict[str, Any]:
     uplinks = uplink_result.get("uplinks") or []
     latest = uplinks[0] if uplinks else None
     return {
         "ok": uplink_result.get("ok", False),
         "status_code": uplink_result.get("status_code"),
         "elapsed_ms": uplink_result.get("elapsed_ms"),
-        "latest": _summarize_uplink(latest),
+        "latest": _summarize_one_uplink(latest),
         "count": len(uplinks),
     }
 
 
+# Pick the uplink-matching rule based on the command being tested.
 def _build_matcher(data_hex: str, mode: str) -> tuple[str, Callable[[dict[str, Any]], bool]]:
     ht = HumidityTempSensor()
     ta = HWT901BSensor()
@@ -113,16 +201,8 @@ class DtuSensorCheck:
     uplink_page_size: int = 20
     shared_auth_result: dict[str, Any] | None = None
 
-    def _auth_result(self) -> dict[str, Any]:
-        return self.shared_auth_result or authenticate(
-            self.base_url,
-            self.account,
-            self.password,
-            self.auth_timeout,
-        )
-
-    def capture_baseline(self, auth_result: dict[str, Any] | None = None, reference: str | None = None) -> dict[str, Any]:
-        auth_result = auth_result or self._auth_result()
+    def prepare_uplink_check(self, auth_result: dict[str, Any], reference: str | None = None) -> dict[str, Any]:
+        # Capture the current uplink state before the shared request is sent.
         baseline_result = pull_latest_uplinks(
             self.base_url,
             self.device_id,
@@ -135,7 +215,7 @@ class DtuSensorCheck:
             "reference": reference or self.reference or build_reference("dtu-sensor-test"),
             "baseline_result": baseline_result,
             "baseline_ts": _latest_seen_ts(baseline_result),
-            "baseline_summary": _summarize_uplink_result(baseline_result),
+            "baseline_summary": _summarize_uplink_query(baseline_result),
         }
 
     def finalize_with_queue(
@@ -144,6 +224,7 @@ class DtuSensorCheck:
         queue_result: dict[str, Any] | None,
         trigger_start_ts: float | None,
     ) -> dict[str, Any]:
+        # Wait for a fresh uplink that matches the expected sensor response.
         auth_result = prepared["auth_result"]
         baseline_summary = prepared["baseline_summary"]
         baseline_result = prepared["baseline_result"]
@@ -193,7 +274,7 @@ class DtuSensorCheck:
             time.sleep(self.poll_interval)
 
         success = matched_uplink is not None
-        last_uplink_summary = _summarize_uplink_result(last_uplink_result)
+        last_uplink_summary = _summarize_uplink_query(last_uplink_result)
         return {
             "result": "PASS" if success else "FAIL",
             "stage": "dtu_sensor",
@@ -213,37 +294,24 @@ class DtuSensorCheck:
             "uplink": {
                 "ok": success,
                 "freshness_cutoff": freshness_cutoff,
-                "matched": _summarize_uplink(matched_uplink),
+                "matched": _summarize_one_uplink(matched_uplink),
                 "last_poll": last_uplink_summary,
             },
         }
 
-    def run(self) -> dict[str, Any]:
-        auth_result = self._auth_result()
-        if not auth_result["ok"]:
-            return {
-                "result": "FAIL",
-                "stage": "dtu_sensor",
-                "target": classify_target(self.base_url),
-                "base_url": self.base_url,
-                "device_id": self.device_id,
-                "auth": auth_result,
-            }
-
-        prepared = self.capture_baseline(auth_result=auth_result)
-        trigger_start_ts = None
-        queue_result = None
-
-        if self.data_hex:
-            trigger_start_ts = time.time()
-            queue_result = queue_downlink(
-                self.base_url,
-                self.device_id,
-                auth_result["token"],
-                self.data_hex,
-                self.fport,
-                prepared["reference"],
-                self.queue_timeout,
-            )
-
-        return self.finalize_with_queue(prepared, queue_result, trigger_start_ts)
+    @staticmethod
+    def summarize(payload: dict[str, Any]) -> dict[str, Any]:
+        # Keep only the fields that matter in the final end-to-end summary.
+        if payload.get("result") == "NOT_RUN":
+            return payload
+        uplink = payload.get("uplink") or {}
+        matched = uplink.get("matched") or {}
+        return {
+            "result": payload.get("result"),
+            "mode": payload.get("mode"),
+            "matcher": payload.get("matcher"),
+            "reference": payload.get("reference"),
+            "uplink_ok": uplink.get("ok"),
+            "matched_hex": matched.get("hex"),
+            "matched_insert_time": matched.get("insert_time"),
+        }

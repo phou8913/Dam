@@ -2,29 +2,252 @@
 
 from __future__ import annotations
 
+import json
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 try:
-    from .connectivity_common import (
-        MqttTopicListener,
-        authenticate,
-        build_ack_topic,
-        build_reference,
-        classify_target,
-        get_fake_ack,
-        queue_downlink,
-    )
+    import paho.mqtt.client as mqtt
 except ImportError:
-    from connectivity_common import (
-        MqttTopicListener,
-        authenticate,
-        build_ack_topic,
-        build_reference,
-        classify_target,
-        get_fake_ack,
-        queue_downlink,
+    mqtt = None
+
+from connectivity_common import (
+    build_reference,
+    classify_target,
+    result_payload,
+)
+
+
+# Build the MQTT topic used to receive the device ACK.
+def build_ack_topic(application_id: str, device_id: str) -> str:
+    return f"application/{application_id}/device/{device_id}/ack"
+
+
+# Fake mode reads ACKs from the local HTTP test server instead of MQTT.
+def get_fake_ack(
+    base_url: str,
+    device_id: str,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    import requests
+
+    url = f"{base_url}/v1/devices/{device_id}/ack"
+    started = time.time()
+    try:
+        response = requests.get(url, timeout=timeout)
+        elapsed_ms = round((time.time() - started) * 1000, 2)
+    except requests.RequestException as exc:
+        return result_payload(
+            False,
+            "ack",
+            error_type="NETWORK_FAIL",
+            error_message=str(exc),
+            url=url,
+        )
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if not response.ok:
+        return result_payload(
+            False,
+            "ack",
+            error_type="HTTP_FAIL",
+            error_message="Failed to fetch fake ack",
+            url=url,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+            response_body=body if body is not None else response.text,
+        )
+
+    return result_payload(
+        True,
+        "ack",
+        url=url,
+        status_code=response.status_code,
+        elapsed_ms=elapsed_ms,
+        payload=body if isinstance(body, dict) else {},
+        acknowledged=body.get("acknowledged") if isinstance(body, dict) else None,
     )
+
+
+# Small helper that connects, subscribes, and waits for one MQTT topic message.
+class MqttTopicListener:
+    # Store connection settings and mutable listener state.
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        client_id: str,
+        keepalive: int,
+        use_tls: bool,
+        topic: str,
+        expected_device_id: Optional[str] = None,
+    ):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.client_id = client_id
+        self.keepalive = keepalive
+        self.use_tls = use_tls
+        self.topic = topic
+        self.expected_device_id = expected_device_id
+        self.client: Optional["mqtt.Client"] = None
+        self.connect_event = threading.Event()
+        self.message_event = threading.Event()
+        self.error: Optional[str] = None
+        self.received_payload: Optional[dict[str, Any]] = None
+        self.received_topic: Optional[str] = None
+        self.received_at: Optional[float] = None
+
+    # MQTT callbacks update the listener state as the client runs.
+    def on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            client.subscribe(self.topic, qos=0)
+            self.connect_event.set()
+        else:
+            self.error = f"MQTT connect failed with code {reason_code}"
+            self.connect_event.set()
+
+    def on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except Exception as exc:
+            self.error = f"Failed to parse topic payload: {exc}"
+            self.message_event.set()
+            return
+
+        if self.expected_device_id is not None and str(payload.get("devEUI")) != self.expected_device_id:
+            return
+
+        self.received_payload = payload
+        self.received_topic = msg.topic
+        self.received_at = time.time()
+        self.message_event.set()
+
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        if reason_code != 0 and not self.message_event.is_set():
+            self.error = f"MQTT disconnected unexpectedly with code {reason_code}"
+            self.message_event.set()
+
+    # Open the MQTT connection and wait until subscription is ready.
+    def start(self, timeout_sec: float) -> dict[str, Any]:
+        if mqtt is None:
+            return result_payload(
+                False,
+                "mqtt",
+                error_type="DEPENDENCY_MISSING",
+                error_message="Missing dependency: paho-mqtt. Install with 'pip install paho-mqtt'.",
+            )
+
+        try:
+            self.client = mqtt.Client(client_id=self.client_id, protocol=mqtt.MQTTv311)
+            self.client.username_pw_set(self.username, self.password)
+            if self.use_tls:
+                self.client.tls_set()
+            self.client.on_connect = self.on_connect
+            self.client.on_message = self.on_message
+            self.client.on_disconnect = self.on_disconnect
+            self.client.connect(self.host, self.port, self.keepalive)
+            self.client.loop_start()
+        except Exception as exc:
+            return result_payload(
+                False,
+                "mqtt",
+                error_type="NETWORK_FAIL",
+                error_message=str(exc),
+                host=self.host,
+                port=self.port,
+                topic=self.topic,
+            )
+
+        connected = self.connect_event.wait(timeout_sec)
+        if not connected:
+            self.stop()
+            return result_payload(
+                False,
+                "mqtt",
+                error_type="TIMEOUT",
+                error_message="Timed out waiting for MQTT connection/subscription",
+                host=self.host,
+                port=self.port,
+                topic=self.topic,
+            )
+
+        if self.error:
+            self.stop()
+            return result_payload(
+                False,
+                "mqtt",
+                error_type="CONNECT_FAIL",
+                error_message=self.error,
+                host=self.host,
+                port=self.port,
+                topic=self.topic,
+            )
+
+        return result_payload(
+            True,
+            "mqtt",
+            host=self.host,
+            port=self.port,
+            topic=self.topic,
+            client_id=self.client_id,
+        )
+
+    # Wait for the expected topic message after the listener has started.
+    def wait_for_message(
+        self,
+        timeout_sec: float,
+        stage: str = "message",
+        extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        got_message = self.message_event.wait(timeout_sec)
+        if self.error and not self.received_payload:
+            return result_payload(
+                False,
+                stage,
+                error_type="MQTT_RUNTIME_FAIL",
+                error_message=self.error,
+                topic=self.topic,
+                **(extra or {}),
+            )
+
+        if not got_message:
+            return result_payload(
+                False,
+                stage,
+                error_type="TIMEOUT",
+                error_message="Timed out waiting for MQTT topic message",
+                topic=self.topic,
+                timeout_sec=timeout_sec,
+                **(extra or {}),
+            )
+
+        return result_payload(
+            True,
+            stage,
+            topic=self.received_topic,
+            received_at=self.received_at,
+            payload=self.received_payload,
+            **(extra or {}),
+        )
+
+    # Stop the MQTT loop and close the connection.
+    def stop(self):
+        if self.client is not None:
+            try:
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -49,16 +272,8 @@ class GatewayDtuCheck:
     mqtt_tls: bool = False
     shared_auth_result: dict[str, Any] | None = None
 
-    def _auth_result(self) -> dict[str, Any]:
-        return self.shared_auth_result or authenticate(
-            self.base_url,
-            self.account,
-            self.password,
-            self.auth_timeout,
-        )
-
-    def prepare_ack_monitor(self, auth_result: dict[str, Any] | None = None, reference: str | None = None) -> dict[str, Any]:
-        auth_result = auth_result or self._auth_result()
+    def prepare_ack_monitor(self, auth_result: dict[str, Any], reference: str | None = None) -> dict[str, Any]:
+        # Set up ACK monitoring before the shared downlink is sent.
         reference = reference or self.reference or build_reference("gw-dtu-test")
         ack_topic = build_ack_topic(self.application_id, self.device_id)
         target = classify_target(self.base_url)
@@ -108,6 +323,7 @@ class GatewayDtuCheck:
         }
 
     def finalize_with_queue(self, prepared: dict[str, Any], queue_result: dict[str, Any]) -> dict[str, Any]:
+        # Use the queue result and ACK outcome to finish this segment.
         auth_result = prepared["auth_result"]
         mqtt_result = prepared["mqtt_result"]
         listener = prepared.get("listener")
@@ -161,41 +377,31 @@ class GatewayDtuCheck:
             "ack": ack_result,
         }
 
-    def run(self) -> dict[str, Any]:
-        auth_result = self._auth_result()
-        if not auth_result["ok"]:
-            return {
-                "result": "FAIL",
-                "stage": "gateway_dtu",
-                "base_url": self.base_url,
-                "application_id": self.application_id,
-                "device_id": self.device_id,
-                "auth": auth_result,
-            }
-
-        prepared = self.prepare_ack_monitor(auth_result=auth_result)
-        if not prepared["ok"]:
-            return {
-                "result": "FAIL",
-                "stage": "gateway_dtu",
-                "base_url": self.base_url,
-                "application_id": self.application_id,
-                "device_id": self.device_id,
-                "auth": {
-                    "ok": True,
-                    "status_code": auth_result.get("status_code"),
-                    "elapsed_ms": auth_result.get("elapsed_ms"),
-                },
-                "mqtt": prepared.get("mqtt_result"),
-            }
-
-        queue_result = queue_downlink(
-            self.base_url,
-            self.device_id,
-            auth_result["token"],
-            self.data_hex,
-            self.fport,
-            prepared["reference"],
-            self.queue_timeout,
-        )
-        return self.finalize_with_queue(prepared, queue_result)
+    @staticmethod
+    def summarize(payload: dict[str, Any]) -> dict[str, Any]:
+        # Keep only the fields that matter in the final end-to-end summary.
+        if payload.get("result") == "NOT_RUN":
+            return payload
+        ack = payload.get("ack") or {}
+        queue = payload.get("queue") or {}
+        mqtt = payload.get("mqtt") or {}
+        request_payload = queue.get("request_payload") or {}
+        ack_payload = ack.get("payload") or {}
+        failure_phase = None
+        if payload.get("result") == "FAIL":
+            if mqtt and not mqtt.get("ok", True):
+                failure_phase = "mqtt_prepare"
+            elif queue and not queue.get("ok", True):
+                failure_phase = "queue"
+            elif ack and not ack.get("ok", True):
+                failure_phase = "ack"
+        return {
+            "result": payload.get("result"),
+            "failure_phase": failure_phase,
+            "mqtt_ok": mqtt.get("ok"),
+            "queue_ok": queue.get("ok"),
+            "ack_ok": ack.get("ok"),
+            "acknowledged": ack.get("acknowledged"),
+            "reference": payload.get("reference") or request_payload.get("reference") or ack_payload.get("reference"),
+            "ack_topic": payload.get("ack_topic") or mqtt.get("topic"),
+        }

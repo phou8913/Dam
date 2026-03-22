@@ -5,10 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-try:
-    from .connectivity_common import authenticate, classify_target, queue_downlink
-except ImportError:
-    from connectivity_common import authenticate, classify_target, queue_downlink
+from connectivity_common import classify_target
 
 
 @dataclass
@@ -24,15 +21,7 @@ class ClientServerCheck:
     queue_timeout: float = 10.0
     shared_auth_result: dict[str, Any] | None = None
 
-    def _auth_result(self) -> dict[str, Any]:
-        return self.shared_auth_result or authenticate(
-            self.base_url,
-            self.account,
-            self.password,
-            self.auth_timeout,
-        )
-
-    def build_result(self, auth_result: dict[str, Any], queue_result: dict[str, Any], reference: str) -> dict[str, Any]:
+    def finalize_with_queue(self, auth_result: dict[str, Any], queue_result: dict[str, Any], reference: str) -> dict[str, Any]:
         success = queue_result["ok"]
         request_payload = queue_result.get("request_payload") or {}
         return {
@@ -50,25 +39,17 @@ class ClientServerCheck:
             "reference": reference or request_payload.get("reference"),
         }
 
-    def run(self) -> dict[str, Any]:
-        auth_result = self._auth_result()
-        if not auth_result["ok"]:
-            return {
-                "result": "FAIL",
-                "stage": "client_server",
-                "target": classify_target(self.base_url),
-                "base_url": self.base_url,
-                "device_id": self.device_id,
-                "auth": auth_result,
-            }
-
-        queue_result = queue_downlink(
-            self.base_url,
-            self.device_id,
-            auth_result["token"],
-            self.data_hex,
-            self.fport,
-            self.reference,
-            self.queue_timeout,
-        )
-        return self.build_result(auth_result, queue_result, self.reference)
+    @staticmethod
+    def summarize(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("result") == "NOT_RUN":
+            return payload
+        queue = payload.get("queue") or {}
+        request_payload = queue.get("request_payload") or {}
+        return {
+            "result": payload.get("result"),
+            "queue_ok": queue.get("ok"),
+            "status_code": queue.get("status_code"),
+            "reference": request_payload.get("reference"),
+            "data_hex": request_payload.get("data"),
+            "fport": request_payload.get("fPort"),
+        }
