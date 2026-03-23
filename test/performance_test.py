@@ -5,7 +5,7 @@ import json
 import time
 from typing import Any
 
-from connectivity import (
+from connectivity_test import (
     DEFAULT_ACCOUNT,
     DEFAULT_APPLICATION_ID,
     DEFAULT_DEVICE_ID,
@@ -24,7 +24,7 @@ from tools.common_check import choose_base_url
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the end-to-end test multiple times and print simple stats")
-    parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--base-url", default=choose_base_url())
     parser.add_argument("--account", default=DEFAULT_ACCOUNT)
     parser.add_argument("--password", default=DEFAULT_PASSWORD)
@@ -145,9 +145,13 @@ def main() -> int:
             print(json.dumps(result, indent=2))
 
     passed = sum(1 for run in runs if run.get("result") == "PASS")
+    # Time from sending the auth request to receiving the auth response.
     auth_times = [_get_ms(run, "auth", "elapsed_ms") for run in runs]
+    # Time from sending the queue request to receiving the queue response.
     queue_times = [_get_ms(run, "client_server", "queue", "elapsed_ms") for run in runs]
+    # Time from queue submission to receiving the ACK result.
     ack_times = [_get_ms(run, "gateway_dtu", "ack", "elapsed_ms") for run in runs]
+    # Time for the final uplink poll HTTP request itself.
     uplink_poll_times = [_get_ms(run, "dtu_sensor", "uplink", "last_poll", "elapsed_ms") for run in runs]
 
     summary = {

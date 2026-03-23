@@ -39,6 +39,7 @@ This test framework is organized around three simple entry scripts and one `tool
 - **Working directory**: `test`
 - **Main command**: `python test/connectivity_test.py`
 - **Performance command**: `python test/performance_test.py`
+- **Button spam command**: `python test/button_spam_test.py --clicks 10 --sensor ht`
 - **Recommended fake base URL**: `http://127.0.0.1:5000/api`
 - **Shell**: PowerShell
 
@@ -159,4 +160,19 @@ The end-to-end flow sends one shared downlink request for the whole test.
   - Segment 2: **PASS**
   - Segment 3: **FAIL**
   - **Fault location**: `dtu -> sensor`
-<img width="1092" height="1040" alt="image" src="https://github.com/user-attachments/assets/6d332f24-2795-48c0-ad8b-d4d3a790277e" />
+<img width="1092" height="1040" alt="image" src="https://github.com/user-attachments/assets/6d332f24-2795-48c0-ad8b-d4d3a790277e" />  
+
+## Performance Test  
+<img width="796" height="621" alt="image" src="https://github.com/user-attachments/assets/3b6e53cb-9bfa-4a4c-b8cb-168a0936daeb" />  
+
+Measures mean time, median time, p95, and min/max time for five metrics:  
+`total`: End-to-end time  
+`auth_times`: Time from sending the auth request to receiving the auth response  
+`queue_times`: Time from sending the queue request to receiving the queue response  
+`ack_times`: Time from queue submission to receiving the ACK result  
+`uplink_poll_times`: Time for the final uplink poll HTTP request itself  
+
+## Multiple fast button clicks Test
+<img width="886" height="907" alt="image" src="https://github.com/user-attachments/assets/769e3fd3-0f37-4ecf-91c3-97b2829ffb11" />   
+
+The request queue works because repeated clicks are queued and processed one by one.
