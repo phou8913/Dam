@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TEST_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WORKSPACE_ROOT = os.path.dirname(TEST_ROOT)
 if WORKSPACE_ROOT not in sys.path:
     sys.path.insert(0, WORKSPACE_ROOT)
 
@@ -19,7 +20,7 @@ from mmwave_sensor import MMWaveSensor
 from tilt_acc_sensor import HWT901BSensor
 from water_level_sensor import WaterLevelSensor
 
-from connectivity_common import (
+from tools.common_check import (
     build_reference,
     classify_target,
     result_payload,

@@ -6,7 +6,7 @@ Mimics the same endpoints and response format as the real API.
 Usage:
     python fake_server.py
 
-Then configure communicator.py to use BASE_URL = "http://localhost:5000/api"
+Then configure communicator.py to use BASE_URL = "http://127.0.0.1:5000/api"
 """
 
 from flask import Flask, request, jsonify
@@ -367,9 +367,9 @@ if __name__ == '__main__':
     print("=" * 60)
     print("Fake LoRa Gateway Server")
     print("=" * 60)
-    print("Server running at: http://localhost:5000")
+    print("Server running at: http://127.0.0.1:5000")
     print("\nTo use this fake server, configure communicator.py:")
-    print("  BASE_URL = 'http://localhost:5000/api'")
+    print("  BASE_URL = 'http://127.0.0.1:5000/api'")
     print("\nEndpoints:")
     print("  POST /api/v1/internal/auth")
     print("  POST /api/v1/devices/<device_id>/queue")

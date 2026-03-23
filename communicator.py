@@ -382,7 +382,7 @@ def send_and_wait(
     timeout_sec: float = 30.0,
     fport: int = 1,
     reference: str = "downlink-cmd",
-    min_interval_sec: float = 1.0,
+    min_interval_sec: float = 2.0,
     poll_interval_sec: float = 1.0,
 ) -> Tuple[int, Optional[str]]:
     # For request/response sensors, send a command and wait for the next matching uplink.

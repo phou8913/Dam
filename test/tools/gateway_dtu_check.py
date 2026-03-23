@@ -13,7 +13,7 @@ try:
 except ImportError:
     mqtt = None
 
-from connectivity_common import (
+from tools.common_check import (
     build_reference,
     classify_target,
     result_payload,
@@ -356,6 +356,10 @@ class GatewayDtuCheck:
             if ack_result.get("ok"):
                 payload = ack_result.get("payload") or {}
                 ack_result["acknowledged"] = payload.get("acknowledged")
+                queue_ts = queue_result.get("timestamp")
+                received_at = ack_result.get("received_at")
+                if isinstance(queue_ts, (int, float)) and isinstance(received_at, (int, float)):
+                    ack_result["elapsed_ms"] = round((received_at - queue_ts) * 1000, 2)
             listener.stop()
 
         success = ack_result["ok"] and ack_result.get("acknowledged") is True

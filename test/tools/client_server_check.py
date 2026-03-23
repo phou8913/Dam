@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from connectivity_common import classify_target
+from tools.common_check import classify_target
 
 
 @dataclass

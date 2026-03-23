@@ -11,13 +11,15 @@ import requests
 
 
 REAL_BASE_URL = "http://99.10.226.29:4560/api"
-FAKE_BASE_URL = "http://localhost:5000/api"
+FAKE_BASE_URL = "http://127.0.0.1:5000/api"
+FAKE_LOCALHOST_BASE_URL = "http://localhost:5000/api"
 
 
 def classify_target(base_url: str) -> str:
-    if base_url.rstrip("/") == FAKE_BASE_URL.rstrip("/"):
+    normalized = base_url.rstrip("/")
+    if normalized in {FAKE_BASE_URL.rstrip("/"), FAKE_LOCALHOST_BASE_URL.rstrip("/")}:
         return "fake"
-    if base_url.rstrip("/") == REAL_BASE_URL.rstrip("/"):
+    if normalized == REAL_BASE_URL.rstrip("/"):
         return "real"
     return "custom"
 
@@ -29,7 +31,7 @@ def choose_base_url() -> str:
 
     # Prefer the local fake server when it is reachable.
     try:
-        response = requests.get("http://localhost:5000/health", timeout=1.0)
+        response = requests.get("http://127.0.0.1:5000/health", timeout=1.0)
         if response.ok:
             return FAKE_BASE_URL
     except requests.RequestException:

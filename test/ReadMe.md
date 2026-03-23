@@ -4,30 +4,40 @@ This document defines 6 test cases for validating end-to-end connectivity. The c
 
 ## Architecture Overview
 
-This test framework is organized around three check classes and one main orchestrator script. The end-to-end entrypoint now runs the full three-segment flow only.
+This test framework is organized around two simple entry scripts and one `tools` folder. The end-to-end entrypoint runs the full three-segment flow, and the performance entrypoint repeats that same flow multiple times and prints a small summary.
 
-- `client_server_check.py`
+- `tools/client_server_check.py`
   - Contains `ClientServerCheck`
   - Formats the `client -> server` segment result from the shared auth and shared queue response
 
-- `gateway_dtu_check.py`
+- `tools/gateway_dtu_check.py`
   - Contains `GatewayDtuCheck`
   - Prepares ACK monitoring and then verifies whether the shared downlink request produces a valid ACK result
 
-- `dtu_sensor_check.py`
+- `tools/dtu_sensor_check.py`
   - Contains `DtuSensorCheck`
   - Captures the baseline uplink state and then verifies whether a fresh matching uplink appears after the shared request
 
-- `connectivity_end_to_end.py`
+- `tools/common_check.py`
+  - Contains shared helpers like authentication, queue submission, target selection, and shared result formatting
+
+- `connectivity.py`
   - Acts as the main test entrypoint
   - Reuses one authentication result, one shared request, and one shared reference
   - Always runs the three segments in order
   - Stops early when an upstream segment fails
   - Produces a summarized result that indicates the most likely fault location
 
+- `performance.py`
+  - Reuses the same end-to-end flow
+  - Runs it multiple times
+  - Prints a very small performance summary
+
 ## 0. Base Environment
 - **Working directory**: `test`
-- **Main command**: `python connectivity_end_to_end.py`
+- **Main command**: `python test/connectivity.py`
+- **Performance command**: `python test/performance.py`
+- **Recommended fake base URL**: `http://127.0.0.1:5000/api`
 - **Shell**: PowerShell
 
 ## 0.1 Shared Request Model
@@ -148,5 +158,3 @@ The end-to-end flow sends one shared downlink request for the whole test.
   - Segment 3: **FAIL**
   - **Fault location**: `dtu -> sensor`
 <img width="1092" height="1040" alt="image" src="https://github.com/user-attachments/assets/6d332f24-2795-48c0-ad8b-d4d3a790277e" />
-
-

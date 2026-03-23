@@ -1,4 +1,4 @@
-"""End-to-end connectivity entrypoint using three internal check classes."""
+"""End-to-end connectivity test entrypoint."""
 
 import argparse
 import json
@@ -8,10 +8,16 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from connectivity_common import authenticate, build_reference, choose_base_url, classify_target, queue_downlink
-from client_server_check import ClientServerCheck
-from dtu_sensor_check import DtuSensorCheck
-from gateway_dtu_check import GatewayDtuCheck
+from tools.common_check import (
+    authenticate,
+    build_reference,
+    choose_base_url,
+    classify_target,
+    queue_downlink,
+)
+from tools.client_server_check import ClientServerCheck
+from tools.dtu_sensor_check import DtuSensorCheck
+from tools.gateway_dtu_check import GatewayDtuCheck
 
 DEFAULT_BASE_URL = choose_base_url()
 DEFAULT_ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
@@ -174,28 +180,6 @@ def _build_output(
     return output
 
 
-def _emit_output(
-    *,
-    success: bool,
-    failed_segment: str | None,
-    ctx: SegmentContext,
-    shared_auth_result: Dict[str, Any],
-    results: Dict[str, Dict[str, Any]],
-    verbose: bool,
-) -> int:
-    output = _build_output(
-        success=success,
-        inferred=_infer_fault_location(results),
-        failed_segment=failed_segment,
-        ctx=ctx,
-        shared_auth_result=shared_auth_result,
-        results=results,
-        verbose=verbose,
-    )
-    print(json.dumps(output, indent=2))
-    return 0 if success else 1
-
-
 def _client_server_auth_fail(ctx: SegmentContext, auth_result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "result": "FAIL",
@@ -207,9 +191,8 @@ def _client_server_auth_fail(ctx: SegmentContext, auth_result: Dict[str, Any]) -
     }
 
 
-def main() -> int:
-    args = _parse_args()
-    ctx = _build_context(args)
+def run_end_to_end(ctx: SegmentContext, verbose: bool = False) -> Dict[str, Any]:
+    # Reuse one auth result and one shared reference across all three segments.
     shared_auth_result = authenticate(ctx.base_url, ctx.account, ctx.password, ctx.auth_timeout)
     shared_reference = ctx.reference or build_reference("connectivity-test")
     common_kwargs = {
@@ -256,13 +239,14 @@ def main() -> int:
         results["client_server"] = _client_server_auth_fail(ctx, shared_auth_result)
         results["gateway_dtu"] = _not_run("Skipped because client -> server authentication failed")
         results["dtu_sensor"] = _not_run("Skipped because client -> server authentication failed")
-        return _emit_output(
+        return _build_output(
             success=False,
+            inferred=_infer_fault_location(results),
             failed_segment=FAULT_LABELS["client_server"],
             ctx=ctx,
             shared_auth_result=shared_auth_result,
             results=results,
-            verbose=args.verbose,
+            verbose=verbose,
         )
 
     # 2. Stop if there is no downlink payload to send.
@@ -277,13 +261,14 @@ def main() -> int:
         }
         results["gateway_dtu"] = _not_run("Skipped because request_data_hex is empty")
         results["dtu_sensor"] = _not_run("Skipped because request_data_hex is empty")
-        return _emit_output(
+        return _build_output(
             success=False,
+            inferred=_infer_fault_location(results),
             failed_segment=FAULT_LABELS["client_server"],
             ctx=ctx,
             shared_auth_result=shared_auth_result,
             results=results,
-            verbose=args.verbose,
+            verbose=verbose,
         )
 
     # 3. Prepare the ACK listener before sending the shared request.
@@ -307,13 +292,14 @@ def main() -> int:
             "mqtt": prepared_gateway.get("mqtt_result"),
         }
         results["dtu_sensor"] = _not_run("Skipped because server/platform -> gateway -> dtu failed")
-        return _emit_output(
+        return _build_output(
             success=False,
+            inferred=_infer_fault_location(results),
             failed_segment=FAULT_LABELS["gateway_dtu"],
             ctx=ctx,
             shared_auth_result=shared_auth_result,
             results=results,
-            verbose=args.verbose,
+            verbose=verbose,
         )
 
     # 4. Capture the current uplink state before sending the shared request.
@@ -346,13 +332,14 @@ def main() -> int:
             listener.stop()
         results["gateway_dtu"] = _not_run("Skipped because client -> server failed")
         results["dtu_sensor"] = _not_run("Skipped because client -> server failed")
-        return _emit_output(
+        return _build_output(
             success=False,
+            inferred=_infer_fault_location(results),
             failed_segment=FAULT_LABELS["client_server"],
             ctx=ctx,
             shared_auth_result=shared_auth_result,
             results=results,
-            verbose=args.verbose,
+            verbose=verbose,
         )
 
     # 7. Finalize the gateway -> DTU result using the ACK outcome.
@@ -362,13 +349,14 @@ def main() -> int:
     )
     if results["gateway_dtu"].get("result") != "PASS":
         results["dtu_sensor"] = _not_run("Skipped because server/platform -> gateway -> dtu failed")
-        return _emit_output(
+        return _build_output(
             success=False,
+            inferred=_infer_fault_location(results),
             failed_segment=FAULT_LABELS["gateway_dtu"],
             ctx=ctx,
             shared_auth_result=shared_auth_result,
             results=results,
-            verbose=args.verbose,
+            verbose=verbose,
         )
 
     # 8. Finalize the DTU -> sensor result using the observed uplinks.
@@ -377,14 +365,23 @@ def main() -> int:
         shared_queue_result,
         trigger_start_ts,
     )
-    return _emit_output(
+    return _build_output(
         success=results["dtu_sensor"].get("result") == "PASS",
+        inferred=_infer_fault_location(results),
         failed_segment=None if results["dtu_sensor"].get("result") == "PASS" else FAULT_LABELS["dtu_sensor"],
         ctx=ctx,
         shared_auth_result=shared_auth_result,
         results=results,
-        verbose=args.verbose,
+        verbose=verbose,
     )
+
+
+def main() -> int:
+    args = _parse_args()
+    ctx = _build_context(args)
+    output = run_end_to_end(ctx, verbose=args.verbose)
+    print(json.dumps(output, indent=2))
+    return 0 if output.get("result") == "PASS" else 1
 
 
 if __name__ == "__main__":
