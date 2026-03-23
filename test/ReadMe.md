@@ -1,10 +1,10 @@
 # Connectivity End-to-End Test Cases
 
-This document defines 6 test cases for validating end-to-end connectivity. The cases cover authentication, queue submission, gateway/DTU acknowledgment, and sensor uplink failure scenarios.
+This document defines 6 test cases for validating connectivity. The cases cover authentication, queue submission, gateway/DTU acknowledgment, and sensor uplink failure scenarios.
 
 ## Architecture Overview
 
-This test framework is organized around two simple entry scripts and one `tools` folder. The end-to-end entrypoint runs the full three-segment flow, and the performance entrypoint repeats that same flow multiple times and prints a small summary.
+This test framework is organized around three simple entry scripts and one `tools` folder.
 
 - `tools/client_server_check.py`
   - Contains `ClientServerCheck`
@@ -21,22 +21,24 @@ This test framework is organized around two simple entry scripts and one `tools`
 - `tools/common_check.py`
   - Contains shared helpers like authentication, queue submission, target selection, and shared result formatting
 
-- `connectivity.py`
-  - Acts as the main test entrypoint
+- `connectivity_test.py`
+  - Runs the full three-segment connectivity test
   - Reuses one authentication result, one shared request, and one shared reference
-  - Always runs the three segments in order
   - Stops early when an upstream segment fails
-  - Produces a summarized result that indicates the most likely fault location
+  - Prints the most likely fault location
 
-- `performance.py`
-  - Reuses the same end-to-end flow
-  - Runs it multiple times
-  - Prints a very small performance summary
+- `performance_test.py`
+  - Runs the connectivity test multiple times
+  - Prints a small performance summary
+
+- `button_spam_test.py`
+  - Simulates one user clicking the same sensor button many times
+  - Helps verify queue behavior
 
 ## 0. Base Environment
 - **Working directory**: `test`
-- **Main command**: `python test/connectivity.py`
-- **Performance command**: `python test/performance.py`
+- **Main command**: `python test/connectivity_test.py`
+- **Performance command**: `python test/performance_test.py`
 - **Recommended fake base URL**: `http://127.0.0.1:5000/api`
 - **Shell**: PowerShell
 

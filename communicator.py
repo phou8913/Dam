@@ -12,17 +12,17 @@ from typing import Optional, Tuple, Any, Dict, Callable, List
 
 import requests
 
-from humidity_temp_sensor import HumidityTempSensor
-from tilt_acc_sensor import HWT901BSensor
-from water_level_sensor import WaterLevelSensor
-from mmwave_sensor import MMWaveSensor
+from profiles.humidity_temp_sensor import HumidityTempSensor
+from profiles.tilt_acc_sensor import HWT901BSensor
+from profiles.water_level_sensor import WaterLevelSensor
+from profiles.mmwave_sensor import MMWaveSensor
 
 
 # Backend mode and connection settings.
 USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
 
 REAL_BASE_URL = "http://99.10.226.29:4560/api"
-FAKE_BASE_URL = "http://localhost:5000/api"
+FAKE_BASE_URL = "http://127.0.0.1:5000/api"
 
 
 def _default_base_url(use_fake_server: bool) -> str:
@@ -382,10 +382,10 @@ def send_and_wait(
     timeout_sec: float = 30.0,
     fport: int = 1,
     reference: str = "downlink-cmd",
-    min_interval_sec: float = 2.0,
     poll_interval_sec: float = 1.0,
 ) -> Tuple[int, Optional[str]]:
     # For request/response sensors, send a command and wait for the next matching uplink.
+    freshness_slack_sec = 0.01
     lock = _get_inflight_lock(device_id)
     with lock:
         send_time = time.time()
@@ -395,7 +395,6 @@ def send_and_wait(
             auth_token,
             fport,
             reference,
-            min_interval_sec=min_interval_sec,
             timeout=timeout_sec,
         )
         if status != 1:
@@ -413,7 +412,7 @@ def send_and_wait(
                 with _RESPONSE_TS_LOCK:
                     last_resp_ts = _LAST_RESPONSE_TS.get(device_id, 0.0)
 
-                if uplink["ts"] <= last_resp_ts or uplink["ts"] < send_time:
+                if uplink["ts"] <= last_resp_ts or uplink["ts"] < (send_time - freshness_slack_sec):
                     continue
 
                 hex_data = uplink["hex"]
@@ -443,14 +442,14 @@ def _run_bundle(
         step_type = step.get("type")
 
         if step_type == "send_only":
-            status, _ = send_request(
-                device_id=dev_eui,
-                data_to_send=step["command"],
-                auth_token=auth_token,
-                fport=step.get("fport", 1),
-                reference=step.get("reference", "downlink-cmd"),
-                min_interval_sec=step.get("min_interval_sec", 1.0),
-            )
+            send_kwargs = {
+                "device_id": dev_eui,
+                "data_to_send": step["command"],
+                "auth_token": auth_token,
+                "fport": step.get("fport", 1),
+                "reference": step.get("reference", "downlink-cmd"),
+            }
+            status, _ = send_request(**send_kwargs)
             if status != 1:
                 return False, results, step.get("send_error", "Failed to send command")
 
@@ -461,17 +460,19 @@ def _run_bundle(
             continue
 
         if step_type == "request_response":
-            status, hex_data = send_and_wait(
-                device_id=dev_eui,
-                data_to_send=step["command"],
-                auth_token=auth_token,
-                response_validator=step["validator"],
-                timeout_sec=step.get("timeout_sec", 15.0),
-                fport=step.get("fport", 1),
-                reference=step.get("reference", "downlink-cmd"),
-                min_interval_sec=step.get("min_interval_sec", 1.0),
-                poll_interval_sec=step.get("poll_interval_sec", 1.0),
-            )
+            wait_kwargs = {
+                "device_id": dev_eui,
+                "data_to_send": step["command"],
+                "auth_token": auth_token,
+                "response_validator": step["validator"],
+                "fport": step.get("fport", 1),
+                "reference": step.get("reference", "downlink-cmd"),
+            }
+            if "timeout_sec" in step:
+                wait_kwargs["timeout_sec"] = step["timeout_sec"]
+            if "poll_interval_sec" in step:
+                wait_kwargs["poll_interval_sec"] = step["poll_interval_sec"]
+            status, hex_data = send_and_wait(**wait_kwargs)
             if status != 1 or not hex_data:
                 return False, results, step.get("wait_error", "Failed to get response or timeout")
 
@@ -499,21 +500,7 @@ def read_ht(dev_eui: str) -> Dict[str, Any]:
     profile = HumidityTempSensor()
     try:
         token = get_token()
-        steps = [
-            {
-                "type": "request_response",
-                "command": profile.encode_read_command(),
-                "validator": profile.validate_response,
-                "decoder": profile.decode_response,
-                "reference": "humidity-read",
-                "timeout_sec": 15.0,
-                "min_interval_sec": 1.0,
-                "poll_interval_sec": 1.0,
-                "result_key": "reading",
-                "wait_error": "Failed to get response or timeout",
-                "decode_error": "Failed to decode response",
-            },
-        ]
+        steps = profile.build_read_steps()
         ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
@@ -527,42 +514,7 @@ def read_ta(dev_eui: str) -> Dict[str, Any]:
     profile = HWT901BSensor()
     try:
         token = get_token()
-        steps = [
-            {
-                "type": "send_only",
-                "command": profile.encode_unlock_command(),
-                "reference": "imu-unlock",
-                "min_interval_sec": 1.0,
-                "delay_after_sec": 0.5,
-                "send_error": "Failed to send unlock command",
-            },
-            {
-                "type": "request_response",
-                "command": profile.encode_read_angles_command(),
-                "validator": profile.validate_angles_response,
-                "decoder": profile.decode_angles,
-                "reference": "angles-read",
-                "timeout_sec": 15.0,
-                "min_interval_sec": 1.0,
-                "poll_interval_sec": 1.0,
-                "result_key": "angles",
-                "wait_error": "Failed to read angles",
-                "decode_error": "Failed to decode angles",
-            },
-            {
-                "type": "request_response",
-                "command": profile.encode_read_accel_command(),
-                "validator": profile.validate_accel_response,
-                "decoder": profile.decode_acceleration,
-                "reference": "accel-read",
-                "timeout_sec": 15.0,
-                "min_interval_sec": 1.0,
-                "poll_interval_sec": 1.0,
-                "result_key": "accel",
-                "wait_error": "Failed to read acceleration",
-                "decode_error": "Failed to decode acceleration",
-            },
-        ]
+        steps = profile.build_read_steps()
         ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
@@ -580,21 +532,7 @@ def read_wl(dev_eui: str) -> Dict[str, Any]:
     profile = WaterLevelSensor()
     try:
         token = get_token()
-        steps = [
-            {
-                "type": "request_response",
-                "command": profile.encode_read_command(),
-                "validator": profile.validate_response,
-                "decoder": profile.decode_response,
-                "reference": "water-level-read",
-                "timeout_sec": 15.0,
-                "min_interval_sec": 1.0,
-                "poll_interval_sec": 1.0,
-                "result_key": "reading",
-                "wait_error": "Failed to get response or timeout",
-                "decode_error": "Failed to decode response",
-            },
-        ]
+        steps = profile.build_read_steps()
         ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")

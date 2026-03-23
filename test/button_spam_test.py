@@ -1,6 +1,7 @@
 """Simulate one user clicking the same sensor button many times."""
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -77,7 +78,7 @@ def main() -> int:
         "inflight_final": inflight_lock.locked(),
         "latest_result": latest_result,
     }
-    print(summary)
+    print(json.dumps(summary, indent=2))
     return 0
 
 

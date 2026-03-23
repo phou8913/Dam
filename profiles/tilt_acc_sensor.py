@@ -4,7 +4,7 @@ Modbus RTU parser for LoRa-connected IMU sensor.
 """
 
 import struct
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 class HWT901BSensor:
@@ -32,6 +32,54 @@ class HWT901BSensor:
     def encode_read_accel_command(cls) -> str:
         """Generate read-accel command bytes as hex string."""
         return cls.READ_ACCEL_CMD
+
+
+
+
+    ###Bundle step builders###
+    def build_unlock_step(self) -> Dict[str, Any]:
+        """Build the unlock step for the IMU read bundle."""
+        return {
+            "type": "send_only",
+            "command": self.encode_unlock_command(),
+            "reference": "imu-unlock",
+            "delay_after_sec": 0.5,
+            "send_error": "Failed to send unlock command",
+        }
+
+    def build_angles_step(self) -> Dict[str, Any]:
+        """Build the angle-read step for the IMU read bundle."""
+        return {
+            "type": "request_response",
+            "command": self.encode_read_angles_command(),
+            "validator": self.validate_angles_response,
+            "decoder": self.decode_angles,
+            "reference": "angles-read",
+            "result_key": "angles",
+            "wait_error": "Failed to read angles",
+            "decode_error": "Failed to decode angles",
+        }
+
+    def build_accel_step(self) -> Dict[str, Any]:
+        """Build the acceleration-read step for the IMU read bundle."""
+        return {
+            "type": "request_response",
+            "command": self.encode_read_accel_command(),
+            "validator": self.validate_accel_response,
+            "decoder": self.decode_acceleration,
+            "reference": "accel-read",
+            "result_key": "accel",
+            "wait_error": "Failed to read acceleration",
+            "decode_error": "Failed to decode acceleration",
+        }
+
+    def build_read_steps(self) -> List[Dict[str, Any]]:
+        """Build the full IMU read sequence."""
+        return [
+            self.build_unlock_step(),
+            self.build_angles_step(),
+            self.build_accel_step(),
+        ]
 
     @staticmethod
     def _int16_be(b: bytes) -> int:

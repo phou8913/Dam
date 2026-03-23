@@ -5,7 +5,7 @@ Reads float value representing water level in meters.
 """
 
 import struct
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 
 class WaterLevelSensor:
@@ -21,6 +21,26 @@ class WaterLevelSensor:
     def encode_read_command(cls) -> str:
         """Generate the Modbus read command bytes as hex string."""
         return cls._make_read_command()
+
+
+
+    ###Bundle step builders###
+    def build_read_step(self) -> Dict[str, Any]:
+        """Build the water-level read step."""
+        return {
+            "type": "request_response",
+            "command": self.encode_read_command(),
+            "validator": self.validate_response,
+            "decoder": self.decode_response,
+            "reference": "water-level-read",
+            "result_key": "reading",
+            "wait_error": "Failed to get response or timeout",
+            "decode_error": "Failed to decode response",
+        }
+
+    def build_read_steps(self) -> List[Dict[str, Any]]:
+        """Build the full water-level read sequence."""
+        return [self.build_read_step()]
 
     @staticmethod
     def _crc16_modbus(data: bytes) -> int:
