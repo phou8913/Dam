@@ -6,10 +6,6 @@ from .modbus_utils import crc16_modbus
 
 
 class WaterLevelSensor(SensorProfile):
-    """
-    Water Level Sensor Profile.
-    Only handles command byte generation and response decoding.
-    """
 
     SLAVE_ADDR = 123
 
@@ -43,14 +39,7 @@ class WaterLevelSensor(SensorProfile):
             print(f"Error parsing water level: {e}")
             return None
 
-    def build_steps(self) -> List[Dict[str, Any]]:
-        ### Build bundled messages
-        return [{"mode": "read"}]
-
-
-
-
-    ### Only used in legacy test tools, later they will be deleted in favor of build_steps() and build_request() with mode parameter 
+    ### Only used in legacy test tools, later they will be deleted in favor of build_request() with mode parameter
     @classmethod
     def encode_read_command(cls) -> str:
         """Compatibility wrapper for tools that still expect a hex command."""

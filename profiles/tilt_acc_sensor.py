@@ -5,10 +5,6 @@ from .base import SensorProfile
 
 
 class HWT901BSensor(SensorProfile):
-    """
-    HWT901B IMU Sensor Profile.
-    Only handles command byte generation and response decoding.
-    """
 
     @classmethod
     def build_request(cls, mode: str = "angles") -> bytes:
@@ -54,18 +50,7 @@ class HWT901BSensor(SensorProfile):
             print(f"Error parsing IMU response: {e}")
             return None
 
-    def build_steps(self) -> List[Dict[str, Any]]:
-        ### Build bundled messages
-        return [
-            {"mode": "unlock"},
-            {"mode": "angles"},
-            {"mode": "accel"},
-        ]
-
-
-
-
-    ### Only used in legacy test tools, later they will be deleted in favor of build_steps() and build_request() with mode parameter 
+    ### Only used in legacy test tools, later they will be deleted in favor of build_request() with mode parameter
     @classmethod
     def encode_unlock_command(cls) -> str:
         """Compatibility wrapper for tools that still expect a hex command."""

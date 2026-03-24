@@ -6,11 +6,7 @@ from .modbus_utils import crc16_modbus
 
 
 class HumidityTempSensor(SensorProfile):
-    """
-    Humidity and Temperature Sensor Profile.
-    Only handles command byte generation and response decoding.
-    """
-
+    
     SLAVE_ADDR = 0x01
 
     @classmethod
@@ -45,14 +41,7 @@ class HumidityTempSensor(SensorProfile):
             print(f"Error during value parsing: {e}")
             return None
 
-    def build_steps(self) -> List[Dict[str, Any]]:
-        ### Build bundled messages
-        return [{"mode": "read"}]
-
-
-
-
-    ### Only used in legacy test tools, later they will be deleted in favor of build_steps() and build_request() with mode parameter 
+    ### Only used in legacy test tools, later they will be deleted in favor of build_request() with mode parameter
     @classmethod
     def encode_read_command(cls) -> str:
         """Compatibility wrapper for tools that still expect a hex command."""

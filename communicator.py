@@ -430,27 +430,26 @@ def _run_bundle(
     profile: Any,
     dev_eui: str,
     auth_token: str,
-    steps: List[Dict[str, Any]],
+    steps: List[str],
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     results: Dict[str, Any] = {}
 
-    for step in steps:
-        mode = step["mode"]
+    for mode in steps:
         command_hex = profile.build_request(mode).hex()
         wait_for_response = mode != "unlock"
-        reference = step.get("reference", mode)
-        result_key = step.get("result_key", "reading" if mode == "read" else mode)
-        wait_error = step.get("wait_error", f"Failed to get response for {mode}")
-        decode_error = step.get("decode_error", f"Failed to decode response for {mode}")
-        send_error = step.get("send_error", f"Failed to send command for {mode}")
-        delay_after_sec = step.get("delay_after_sec", 0.5 if mode == "unlock" else 0.0)
+        reference = mode
+        result_key = "reading" if mode == "read" else mode
+        wait_error = f"Failed to get response for {mode}"
+        decode_error = f"Failed to decode response for {mode}"
+        send_error = f"Failed to send command for {mode}"
+        delay_after_sec = 0.5 if mode == "unlock" else 0.0
 
         if not wait_for_response:
             send_kwargs = {
                 "device_id": dev_eui,
                 "data_to_send": command_hex,
                 "auth_token": auth_token,
-                "fport": step.get("fport", 1),
+                "fport": 1,
                 "reference": reference,
             }
             status, _ = send_request(**send_kwargs)
@@ -466,13 +465,9 @@ def _run_bundle(
             "device_id": dev_eui,
             "data_to_send": command_hex,
             "auth_token": auth_token,
-            "fport": step.get("fport", 1),
+            "fport": 1,
             "reference": reference,
         }
-        if "timeout_sec" in step:
-            wait_kwargs["timeout_sec"] = step["timeout_sec"]
-        if "poll_interval_sec" in step:
-            wait_kwargs["poll_interval_sec"] = step["poll_interval_sec"]
         status, hex_data = send_and_wait(**wait_kwargs)
         if status != 1 or not hex_data:
             return False, results, wait_error
@@ -495,7 +490,7 @@ def read_ht(dev_eui: str) -> Dict[str, Any]:
     profile = HumidityTempSensor()
     try:
         token = get_token()
-        steps = profile.build_steps()
+        steps = ["read"]
         ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
@@ -509,7 +504,7 @@ def read_ta(dev_eui: str) -> Dict[str, Any]:
     profile = HWT901BSensor()
     try:
         token = get_token()
-        steps = profile.build_steps()
+        steps = ["unlock", "angles", "accel"]
         ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
@@ -527,7 +522,7 @@ def read_wl(dev_eui: str) -> Dict[str, Any]:
     profile = WaterLevelSensor()
     try:
         token = get_token()
-        steps = profile.build_steps()
+        steps = ["read"]
         ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
