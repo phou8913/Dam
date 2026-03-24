@@ -8,7 +8,7 @@ import threading
 import queue
 import base64
 from datetime import datetime
-from typing import Optional, Tuple, Any, Dict, Callable, List
+from typing import Optional, Tuple, Any, Dict, List
 
 import requests
 
@@ -378,7 +378,6 @@ def send_and_wait(
     device_id: str,
     data_to_send: str,
     auth_token: str,
-    response_validator: Callable[[str], bool],
     timeout_sec: float = 30.0,
     fport: int = 1,
     reference: str = "downlink-cmd",
@@ -416,15 +415,11 @@ def send_and_wait(
                     continue
 
                 hex_data = uplink["hex"]
-                try:
-                    if response_validator(hex_data):
-                        with _RESPONSE_TS_LOCK:
-                            if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
-                                continue
-                            _LAST_RESPONSE_TS[device_id] = uplink["ts"]
-                        return 1, hex_data
-                except Exception as e:
-                    print(f"[send_and_wait] Validator error: {e}")
+                with _RESPONSE_TS_LOCK:
+                    if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
+                        continue
+                    _LAST_RESPONSE_TS[device_id] = uplink["ts"]
+                return 1, hex_data
 
         print(f"[send_and_wait] Timeout waiting for response from {device_id}")
         return 0, None
@@ -432,6 +427,7 @@ def send_and_wait(
 
 # Run bundled sensor steps that must stay in sequence.
 def _run_bundle(
+    profile: Any,
     dev_eui: str,
     auth_token: str,
     steps: List[Dict[str, Any]],
@@ -439,58 +435,57 @@ def _run_bundle(
     results: Dict[str, Any] = {}
 
     for step in steps:
-        step_type = step.get("type")
+        mode = step["mode"]
+        command_hex = profile.build_request(mode).hex()
+        wait_for_response = mode != "unlock"
+        reference = step.get("reference", mode)
+        result_key = step.get("result_key", "reading" if mode == "read" else mode)
+        wait_error = step.get("wait_error", f"Failed to get response for {mode}")
+        decode_error = step.get("decode_error", f"Failed to decode response for {mode}")
+        send_error = step.get("send_error", f"Failed to send command for {mode}")
+        delay_after_sec = step.get("delay_after_sec", 0.5 if mode == "unlock" else 0.0)
 
-        if step_type == "send_only":
+        if not wait_for_response:
             send_kwargs = {
                 "device_id": dev_eui,
-                "data_to_send": step["command"],
+                "data_to_send": command_hex,
                 "auth_token": auth_token,
                 "fport": step.get("fport", 1),
-                "reference": step.get("reference", "downlink-cmd"),
+                "reference": reference,
             }
             status, _ = send_request(**send_kwargs)
             if status != 1:
-                return False, results, step.get("send_error", "Failed to send command")
+                return False, results, send_error
 
-            delay_after_sec = step.get("delay_after_sec", 0.0)
             if delay_after_sec > 0:
                 time.sleep(delay_after_sec)
 
             continue
 
-        if step_type == "request_response":
-            wait_kwargs = {
-                "device_id": dev_eui,
-                "data_to_send": step["command"],
-                "auth_token": auth_token,
-                "response_validator": step["validator"],
-                "fport": step.get("fport", 1),
-                "reference": step.get("reference", "downlink-cmd"),
-            }
-            if "timeout_sec" in step:
-                wait_kwargs["timeout_sec"] = step["timeout_sec"]
-            if "poll_interval_sec" in step:
-                wait_kwargs["poll_interval_sec"] = step["poll_interval_sec"]
-            status, hex_data = send_and_wait(**wait_kwargs)
-            if status != 1 or not hex_data:
-                return False, results, step.get("wait_error", "Failed to get response or timeout")
+        wait_kwargs = {
+            "device_id": dev_eui,
+            "data_to_send": command_hex,
+            "auth_token": auth_token,
+            "fport": step.get("fport", 1),
+            "reference": reference,
+        }
+        if "timeout_sec" in step:
+            wait_kwargs["timeout_sec"] = step["timeout_sec"]
+        if "poll_interval_sec" in step:
+            wait_kwargs["poll_interval_sec"] = step["poll_interval_sec"]
+        status, hex_data = send_and_wait(**wait_kwargs)
+        if status != 1 or not hex_data:
+            return False, results, wait_error
 
-            decoded = step["decoder"](hex_data)
-            if not decoded:
-                return False, results, step.get("decode_error", "Failed to decode response")
+        decoded = profile.decode_response(hex_data, mode=mode)
+        if not decoded:
+            return False, results, decode_error
 
-            result_key = step.get("result_key")
-            if result_key:
-                results[result_key] = decoded
+        if result_key:
+            results[result_key] = decoded
 
-            delay_after_sec = step.get("delay_after_sec", 0.0)
-            if delay_after_sec > 0:
-                time.sleep(delay_after_sec)
-
-            continue
-
-        return False, results, f"Unsupported bundle step type: {step_type}"
+        if delay_after_sec > 0:
+            time.sleep(delay_after_sec)
 
     return True, results, None
 
@@ -500,8 +495,8 @@ def read_ht(dev_eui: str) -> Dict[str, Any]:
     profile = HumidityTempSensor()
     try:
         token = get_token()
-        steps = profile.build_read_steps()
-        ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
+        steps = profile.build_steps()
+        ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
         return _result(True, data=bundle_results["reading"])
@@ -514,8 +509,8 @@ def read_ta(dev_eui: str) -> Dict[str, Any]:
     profile = HWT901BSensor()
     try:
         token = get_token()
-        steps = profile.build_read_steps()
-        ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
+        steps = profile.build_steps()
+        ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
 
@@ -532,8 +527,8 @@ def read_wl(dev_eui: str) -> Dict[str, Any]:
     profile = WaterLevelSensor()
     try:
         token = get_token()
-        steps = profile.build_read_steps()
-        ok, bundle_results, error = _run_bundle(dev_eui, token, steps)
+        steps = profile.build_steps()
+        ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed")
         return _result(True, data=bundle_results["reading"])

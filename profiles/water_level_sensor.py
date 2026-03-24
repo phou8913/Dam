@@ -1,82 +1,32 @@
-"""
-Water Level Sensor
-Modbus RTU parser for LoRa-connected water level sensor.
-Reads float value representing water level in meters.
-"""
-
 import struct
 from typing import Optional, Dict, Any, List
 
+from .base import SensorProfile
+from .modbus_utils import crc16_modbus
 
-class WaterLevelSensor:
+
+class WaterLevelSensor(SensorProfile):
     """
     Water Level Sensor Profile.
     Only handles command byte generation and response decoding.
     """
 
-    # Sensor-specific Modbus slave address used by the deployment.
     SLAVE_ADDR = 123
 
     @classmethod
-    def encode_read_command(cls) -> str:
-        """Generate the Modbus read command bytes as hex string."""
-        return cls._make_read_command()
+    def build_request(cls, mode: str = "read") -> bytes:
+        if mode != "read":
+            raise ValueError("Unsupported mode")
 
+        frame = struct.pack(">BBHH", cls.SLAVE_ADDR, 0x03, 0x0000, 0x0002)
+        crc = crc16_modbus(frame)
+        return frame + struct.pack("<H", crc)
 
-
-    ###Bundle step builders###
-    def build_read_step(self) -> Dict[str, Any]:
-        """Build the water-level read step."""
-        return {
-            "type": "request_response",
-            "command": self.encode_read_command(),
-            "validator": self.validate_response,
-            "decoder": self.decode_response,
-            "reference": "water-level-read",
-            "result_key": "reading",
-            "wait_error": "Failed to get response or timeout",
-            "decode_error": "Failed to decode response",
-        }
-
-    def build_read_steps(self) -> List[Dict[str, Any]]:
-        """Build the full water-level read sequence."""
-        return [self.build_read_step()]
-
-    @staticmethod
-    def _crc16_modbus(data: bytes) -> int:
-        """Calculate Modbus RTU CRC16 checksum."""
-        crc = 0xFFFF
-        for b in data:
-            crc ^= b
-            for _ in range(8):
-                if crc & 1:
-                    crc = (crc >> 1) ^ 0xA001
-                else:
-                    crc >>= 1
-        return crc & 0xFFFF
-
-    @classmethod
-    def _make_read_command(cls) -> str:
-        """
-        Create Modbus RTU read holding registers command.
-        Slave: 123, Function: 0x03, Start: 0x0000, Count: 0x0002
-        """
-        frame = struct.pack('>BBHH', cls.SLAVE_ADDR, 0x03, 0x0000, 0x0002)
-        crc = cls._crc16_modbus(frame)
-        crc_bytes = struct.pack('<H', crc)
-        full_frame = frame + crc_bytes
-        return full_frame.hex()
-
-    def validate_response(self, hex_data: str) -> bool:
-        """Temporary passthrough validator (accept all responses)."""
-        return True
-
-    def parse_water_level(self, data) -> Optional[Dict[str, Any]]:
-        """Parsing helper removed; use decode_response instead."""
-        raise NotImplementedError("parse_water_level is not implemented in this profile.")
-
-    def decode_response(self, data) -> Optional[Dict[str, Any]]:
+    def decode_response(self, data, mode: str = "read") -> Optional[Dict[str, Any]]:
         """Decode response bytes/hex into water level value."""
+        if mode != "read":
+            raise ValueError("Unsupported mode")
+
         if isinstance(data, str):
             try:
                 data = bytes.fromhex(data)
@@ -84,41 +34,24 @@ class WaterLevelSensor:
                 print("Error: Invalid hex string")
                 return None
 
-        if len(data) < 9:
-            print(f"Error: Response too short ({len(data)} bytes, expected >= 9)")
-            return None
-
-        func_code = data[1]
-        if func_code != 0x03:
-            print(f"Error: Unknown function code: 0x{func_code:02X}")
-            return None
-
-        frame_len = len(data)
-        data_end = frame_len - 2
-        frame_without_crc = data[:data_end]
-
-        received_crc_bytes = data[data_end:]
-        received_crc = (received_crc_bytes[1] << 8) | received_crc_bytes[0]
-        calculated_crc = self._crc16_modbus(frame_without_crc)
-        crc_valid = (calculated_crc == received_crc)
-
-        byte_count = data[2]
-        if byte_count != 4:
-            print(f"Error: Expected 4 data bytes, got {byte_count}")
-            return None
-
-        data_bytes = data[3:7]
-
         try:
-            # The payload is one big-endian IEEE 754 float in meters.
-            level_m = struct.unpack('>f', data_bytes)[0]
-
             return {
-                "level_m": level_m,
-                "crc_valid": crc_valid,
+                "level_m": struct.unpack(">f", data[3:7])[0],
                 "raw_hex": data.hex()
             }
-
         except Exception as e:
             print(f"Error parsing water level: {e}")
             return None
+
+    def build_steps(self) -> List[Dict[str, Any]]:
+        ### Build bundled messages
+        return [{"mode": "read"}]
+
+
+
+
+    ### Only used in legacy test tools, later they will be deleted in favor of build_steps() and build_request() with mode parameter 
+    @classmethod
+    def encode_read_command(cls) -> str:
+        """Compatibility wrapper for tools that still expect a hex command."""
+        return cls.build_request("read").hex()

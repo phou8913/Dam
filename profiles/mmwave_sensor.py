@@ -14,10 +14,6 @@ class MMWaveSensor:
     Only handles response decoding.
     """
 
-    def parse_mmwave_data(self, data) -> Optional[Dict[str, List[float]]]:
-        """Parsing helper removed; use decode_targets instead."""
-        raise NotImplementedError("parse_mmwave_data is not implemented in this profile.")
-
     def decode_targets(self, data) -> Optional[Dict[str, List[float]]]:
         """Decode response bytes/hex into target list."""
         if isinstance(data, str):

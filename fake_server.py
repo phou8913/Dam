@@ -206,7 +206,8 @@ def process_downlink(device_id: str, hex_data: str, fport: int):
         return
     
     # Humidity/temperature command family.
-    if cmd.startswith("0104"):
+    # Accept both 0x03 and 0x04 read variants during local testing.
+    if cmd.startswith("0103") or cmd.startswith("0104"):
         response_hex = generate_fake_humidity_temp_hex()
         store_uplink(device_id, response_hex, fport)
         return

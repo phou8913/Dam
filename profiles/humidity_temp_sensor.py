@@ -1,104 +1,32 @@
-"""
-Humidity and Temperature Sensor Data Parser
-Parses Modbus RTU response frames from LoRa-connected environmental sensors.
-"""
-
 import struct
 from typing import Optional, Dict, Any, List
 
+from .base import SensorProfile
+from .modbus_utils import crc16_modbus
 
-class HumidityTempSensor:
+
+class HumidityTempSensor(SensorProfile):
     """
     Humidity and Temperature Sensor Profile.
     Only handles command byte generation and response decoding.
     """
 
-    # Fixed Modbus command used to request temperature, humidity, and dewpoint.
-    # Modbus command to read 3 registers: T, H, D
-    MODBUS_READ_CMD = "010400000003B00B"
+    SLAVE_ADDR = 0x01
 
     @classmethod
-    def encode_read_command(cls) -> str:
-        """Generate the Modbus read command bytes as hex string."""
-        return cls.MODBUS_READ_CMD
+    def build_request(cls, mode: str = "read") -> bytes:
+        if mode != "read":
+            raise ValueError("Unsupported mode")
 
+        frame = struct.pack(">BBHH", cls.SLAVE_ADDR, 0x03, 0x0000, 0x0003)
+        crc = crc16_modbus(frame)
+        return frame + struct.pack("<H", crc)
 
-
-    ###Bundle step builders###
-    def build_read_step(self) -> Dict[str, Any]:
-        """Build the humidity/temperature read step."""
-        return {
-            "type": "request_response",
-            "command": self.encode_read_command(),
-            "validator": self.validate_response,
-            "decoder": self.decode_response,
-            "reference": "humidity-read",
-            "result_key": "reading",
-            "wait_error": "Failed to get response or timeout",
-            "decode_error": "Failed to decode response",
-        }
-
-    def build_read_steps(self) -> List[Dict[str, Any]]:
-        """Build the full humidity/temperature read sequence."""
-        return [self.build_read_step()]
-
-    @staticmethod
-    def _crc16_modbus(data: bytes) -> int:
-        """
-        Calculate Modbus RTU CRC16 checksum.
-
-        Args:
-            data: Bytes to calculate CRC for
-
-        Returns:
-            int: 16-bit CRC value
-        """
-        crc = 0xFFFF
-        for b in data:
-            crc ^= b
-            for _ in range(8):
-                if crc & 1:
-                    crc = (crc >> 1) ^ 0xA001
-                else:
-                    crc >>= 1
-        return crc & 0xFFFF
-
-    @staticmethod
-    def _int16_be(b: bytes) -> int:
-        """
-        Convert 2 bytes (Big Endian) to signed 16-bit integer.
-
-        Args:
-            b: 2 bytes to convert
-
-        Returns:
-            int: Signed 16-bit integer
-        """
-        return struct.unpack(">h", b)[0]
-
-    @staticmethod
-    def _uint16_be(b: bytes) -> int:
-        """
-        Convert 2 bytes (Big Endian) to unsigned 16-bit integer.
-
-        Args:
-            b: 2 bytes to convert
-
-        Returns:
-            int: Unsigned 16-bit integer
-        """
-        return struct.unpack(">H", b)[0]
-
-    def validate_response(self, hex_data: str) -> bool:
-        """Temporary passthrough validator (accept all responses)."""
-        return True
-
-    def parse_humidity_sensor_data(self, data) -> Optional[Dict[str, Any]]:
-        """Parsing helper removed; use decode_response instead."""
-        raise NotImplementedError("parse_humidity_sensor_data is not implemented in this profile.")
-
-    def decode_response(self, data) -> Optional[Dict[str, Any]]:
+    def decode_response(self, data, mode: str = "read") -> Optional[Dict[str, Any]]:
         """Decode response bytes/hex into sensor values."""
+        if mode != "read":
+            raise ValueError("Unsupported mode")
+
         if isinstance(data, str):
             try:
                 data = bytes.fromhex(data)
@@ -106,50 +34,26 @@ class HumidityTempSensor:
                 print("Error: Invalid hex string")
                 return None
 
-        if len(data) < 5:
-            print(f"Error: Frame too short ({len(data)} bytes)")
-            return None
-
-        func_code = data[1]
-        if func_code not in (0x03, 0x04):
-            print(f"Error: Unknown Modbus function code: 0x{func_code:02X}")
-            return None
-
-        frame_len = len(data)
-        data_end = frame_len - 2
-        frame_without_crc = data[:data_end]
-
-        received_crc_bytes = data[data_end:]
-        received_crc = (received_crc_bytes[1] << 8) | received_crc_bytes[0]
-        calculated_crc = self._crc16_modbus(frame_without_crc)
-        crc_valid = (calculated_crc == received_crc)
-
-        byte_count = data[2]
-        data_bytes = data[3:3 + byte_count]
-
-        if len(data_bytes) < 6:
-            print(f"Error: Data byte count mismatch. Expected 6, got {len(data_bytes)}")
-            return None
-
         try:
-            # The payload stores signed temperature/dewpoint and unsigned humidity.
-            t_raw = self._int16_be(data_bytes[0:2])
-            temperature_c = t_raw / 100.0
-
-            h_raw = self._uint16_be(data_bytes[2:4])
-            humidity_rh = h_raw / 100.0
-
-            d_raw = self._int16_be(data_bytes[4:6])
-            dewpoint_c = d_raw / 100.0
-
             return {
-                "temperature_c": temperature_c,
-                "humidity_rh": humidity_rh,
-                "dewpoint_c": dewpoint_c,
-                "crc_valid": crc_valid,
+                "temperature_c": struct.unpack(">h", data[3:5])[0] / 100,
+                "humidity_rh": struct.unpack(">h", data[5:7])[0] / 100,
+                "dewpoint_c": struct.unpack(">h", data[7:9])[0] / 100,
                 "raw_hex": data.hex()
             }
-
         except Exception as e:
             print(f"Error during value parsing: {e}")
             return None
+
+    def build_steps(self) -> List[Dict[str, Any]]:
+        ### Build bundled messages
+        return [{"mode": "read"}]
+
+
+
+
+    ### Only used in legacy test tools, later they will be deleted in favor of build_steps() and build_request() with mode parameter 
+    @classmethod
+    def encode_read_command(cls) -> str:
+        """Compatibility wrapper for tools that still expect a hex command."""
+        return cls.build_request("read").hex()
