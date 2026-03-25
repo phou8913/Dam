@@ -1,5 +1,5 @@
 import struct
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from .base import SensorProfile
 

@@ -11,6 +11,10 @@ from datetime import datetime
 from typing import Optional, Tuple, Any, Dict, List
 
 import requests
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    mqtt = None
 
 from profiles.humidity_temp_sensor import HumidityTempSensor
 from profiles.tilt_acc_sensor import HWT901BSensor
@@ -23,6 +27,14 @@ USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
 
 REAL_BASE_URL = "http://99.10.226.29:4560/api"
 FAKE_BASE_URL = "http://127.0.0.1:5000/api"
+APPLICATION_ID = os.getenv("APPLICATION_ID", "18")
+
+MQTT_HOST = os.getenv("MQTT_HOST", "99.10.226.29")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "mqtt_user_1")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "mqtt_pass_1")
+MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "mqtt_client_1")
+MQTT_KEEPALIVE = int(os.getenv("MQTT_KEEPALIVE", "60"))
 
 
 def _default_base_url(use_fake_server: bool) -> str:
@@ -58,7 +70,9 @@ def _log_sensor_header(sensor: str):
 def _log_sensor_result(sensor: str, result: Dict[str, Any]):
     data = result.get("data") or {}
     if not result.get("ok"):
-        _log_line(f"Error: {result.get('error') or 'Unknown error'}")
+        stage = result.get("error_stage") or "unknown"
+        reason = result.get("error") or "Unknown error"
+        _log_line(f"Error at {stage}: {reason}")
         return
 
     if sensor == "ht":
@@ -115,17 +129,23 @@ _DEVICE_WORKERS_LOCK = threading.Lock()
 
 
 # Standard result wrappers for sensor reads.
-def _result(ok: bool, data: Any = None, error: Optional[str] = None) -> Dict[str, Any]:
+def _result(
+    ok: bool,
+    data: Any = None,
+    error: Optional[str] = None,
+    error_stage: Optional[str] = None,
+) -> Dict[str, Any]:
     return {
         "ok": ok,
         "data": data,
         "error": error,
+        "error_stage": error_stage,
         "timestamp": time.time(),
     }
 
 
-def _error_result(error: str) -> Dict[str, Any]:
-    return _result(False, data=None, error=error)
+def _error_result(error: str, error_stage: str) -> Dict[str, Any]:
+    return _result(False, data=None, error=error, error_stage=error_stage)
 
 
 # Backend selection and shared buffer helpers.
@@ -133,7 +153,6 @@ def _error_result(error: str) -> Dict[str, Any]:
 def configure_backend(mode: str = "real"):
     """Switch communicator traffic between the real gateway and the fake local server."""
     global USE_FAKE_SERVER, DEFAULT_BASE_URL, BASE_URL
-
     use_fake_server = mode == "fake"
     USE_FAKE_SERVER = use_fake_server
     DEFAULT_BASE_URL = _default_base_url(use_fake_server)
@@ -207,7 +226,7 @@ class _DeviceWorker:
                 _handle_request(task)
             except Exception as e:
                 sensor = task.get("sensor", "")
-                _write_buffer_result(self.dev_eui, sensor, _error_result(f"Worker exception: {e}"))
+                _write_buffer_result(self.dev_eui, sensor, _error_result(f"Worker exception: {e}", "client->server"))
 
 
 # Sensor-specific request handling and decoding.
@@ -227,7 +246,7 @@ def _handle_request(task: Dict[str, Any]):
 
     reader = dispatch_map.get(sensor)
     if reader is None:
-        result = _error_result(f"Unsupported sensor: {sensor}")
+        result = _error_result(f"Unsupported sensor: {sensor}", "client->server")
     else:
         result = reader(dev_eui)
 
@@ -287,23 +306,116 @@ def get_token() -> str:
         raise RuntimeError(f"Failed to authenticate: {e}")
 
 
+def build_ack_topic(application_id: str, device_id: str) -> str:
+    return f"application/{application_id}/device/{device_id}/ack"
+
+
+class AckListener:
+    """Wait for one ACK message from MQTT."""
+
+    def __init__(self, topic: str):
+        self.topic = topic
+        self.client = None
+        self.connect_event = threading.Event()
+        self.message_event = threading.Event()
+        self.payload: Optional[Dict[str, Any]] = None
+        self.error: Optional[str] = None
+
+    def on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            client.subscribe(self.topic, qos=0)
+            self.connect_event.set()
+        else:
+            self.error = f"MQTT connect failed with code {reason_code}"
+            self.connect_event.set()
+
+    def on_message(self, client, userdata, msg):
+        import json
+
+        try:
+            self.payload = json.loads(msg.payload.decode("utf-8"))
+        except Exception as exc:
+            self.error = f"Failed to parse ACK payload: {exc}"
+        self.message_event.set()
+
+    def start(self, timeout_sec: float) -> bool:
+        if mqtt is None:
+            self.error = "Missing dependency: paho-mqtt"
+            return False
+
+        try:
+            self.client = mqtt.Client(client_id=MQTT_CLIENT_ID, protocol=mqtt.MQTTv311)
+            if MQTT_USERNAME:
+                self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+            self.client.on_connect = self.on_connect
+            self.client.on_message = self.on_message
+            self.client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
+            self.client.loop_start()
+        except Exception as exc:
+            self.error = str(exc)
+            return False
+
+        connected = self.connect_event.wait(timeout_sec)
+        return connected and self.error is None
+
+    def wait(self, timeout_sec: float) -> Tuple[int, Optional[Dict[str, Any]]]:
+        got_message = self.message_event.wait(timeout_sec)
+        if not got_message or self.error:
+            return 0, None
+        return 1, self.payload
+
+    def stop(self):
+        if self.client is not None:
+            try:
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception:
+                pass
+
+
+def get_ack(device_id: str, timeout_sec: float = 10.0) -> Tuple[int, Optional[Dict[str, Any]]]:
+    if USE_FAKE_SERVER:
+        try:
+            url = f"{BASE_URL}/v1/devices/{device_id}/ack"
+            response = requests.get(url, timeout=timeout_sec)
+            response.raise_for_status()
+            return 1, response.json()
+        except Exception as exc:
+            print(f"Error getting ack: {exc}")
+            return 0, None
+
+    topic = build_ack_topic(APPLICATION_ID, device_id)
+    listener = AckListener(topic)
+    started = listener.start(timeout_sec)
+    if not started:
+        print(f"Error getting ack: {listener.error or 'Failed to start MQTT listener'}")
+        listener.stop()
+        return 0, None
+
+    status, payload = listener.wait(timeout_sec)
+    listener.stop()
+    if status != 1 or payload is None:
+        print(f"Error getting ack: {listener.error or 'Timed out waiting for ACK'}")
+        return 0, None
+    return 1, payload
+
+
 def send_request(
     device_id: str,
     data_to_send: str,
     auth_token: str,
     fport: int = 1,
     reference: str = "downlink-cmd",
-    min_interval_sec: float = 1.0,
-    timeout: float = 30.0,
+    request_interval_sec: float = 1.0, ### recommend for real environment: 1.0     Extreme: 0.0 for testing
+    http_timeout_sec: float = 5.0, ### recommend for real environment: 5.0         Extreme: 1.0 for testing
 ) -> Tuple[int, Optional[Any]]:
-    del timeout
     # Enforce minimum spacing so repeated downlinks do not pile up too quickly.
     send_lock = _get_send_lock(device_id)
     with send_lock:
         last_send_ts = _LAST_SEND_TS.get(device_id, 0.0)
         elapsed = time.time() - last_send_ts
-        if elapsed < min_interval_sec:
-            time.sleep(min_interval_sec - elapsed)
+        if elapsed < request_interval_sec:
+            time.sleep(request_interval_sec - elapsed)
         _LAST_SEND_TS[device_id] = time.time()
         try:
             url = f"{BASE_URL}/v1/devices/{device_id}/queue"
@@ -318,7 +430,12 @@ def send_request(
                 "fPort": fport,
                 "reference": reference,
             }
-            response = requests.post(url, json=payload, headers=headers)
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=http_timeout_sec,
+            )
             response.raise_for_status()
             return 1, response.json()
         except Exception as e:
@@ -378,11 +495,11 @@ def send_and_wait(
     device_id: str,
     data_to_send: str,
     auth_token: str,
-    timeout_sec: float = 30.0,
+    response_timeout_sec: float = 10.0, ### recommend for real environment: 10.0        Extreme: 1.0 for testing
     fport: int = 1,
     reference: str = "downlink-cmd",
-    poll_interval_sec: float = 1.0,
-) -> Tuple[int, Optional[str]]:
+    poll_interval_sec: float = 0.5, ### recommend for real environment: 0.5          Extreme: 0.01 for testing
+) -> Tuple[int, Optional[str], Optional[str], Optional[str]]:
     # For request/response sensors, send a command and wait for the next matching uplink.
     freshness_slack_sec = 0.01
     lock = _get_inflight_lock(device_id)
@@ -394,13 +511,19 @@ def send_and_wait(
             auth_token,
             fport,
             reference,
-            timeout=timeout_sec,
         )
         if status != 1:
             print(f"[send_and_wait] Failed to send request to {device_id}")
-            return 0, None
+            return 0, None, "client->server", "Failed to send request"
 
-        deadline = send_time + timeout_sec
+        ack_status, ack_payload = get_ack(device_id, timeout_sec=response_timeout_sec)
+        if ack_status != 1 or ack_payload is None:
+            return 0, None, "gateway->dtu", "No ACK received"
+
+        if not ack_payload.get("acknowledged", False):
+            return 0, None, "gateway->dtu", "ACK received but not acknowledged"
+
+        deadline = send_time + response_timeout_sec
         while time.time() < deadline:
             time.sleep(poll_interval_sec)
             status, uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
@@ -419,10 +542,10 @@ def send_and_wait(
                     if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
                         continue
                     _LAST_RESPONSE_TS[device_id] = uplink["ts"]
-                return 1, hex_data
+                return 1, hex_data, None, None
 
         print(f"[send_and_wait] Timeout waiting for response from {device_id}")
-        return 0, None
+        return 0, None, "dtu->sensor", "No uplink received after ACK"
 
 
 # Run bundled sensor steps that must stay in sequence.
@@ -431,7 +554,7 @@ def _run_bundle(
     dev_eui: str,
     auth_token: str,
     steps: List[str],
-) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+) -> Tuple[bool, Dict[str, Any], Optional[str], Optional[str]]:
     results: Dict[str, Any] = {}
 
     for mode in steps:
@@ -454,7 +577,7 @@ def _run_bundle(
             }
             status, _ = send_request(**send_kwargs)
             if status != 1:
-                return False, results, send_error
+                return False, results, "client->server", send_error
 
             if delay_after_sec > 0:
                 time.sleep(delay_after_sec)
@@ -468,13 +591,13 @@ def _run_bundle(
             "fport": 1,
             "reference": reference,
         }
-        status, hex_data = send_and_wait(**wait_kwargs)
+        status, hex_data, error_stage, error_reason = send_and_wait(**wait_kwargs)
         if status != 1 or not hex_data:
-            return False, results, wait_error
+            return False, results, error_stage or "gateway->dtu", error_reason or wait_error
 
         decoded = profile.decode_response(hex_data, mode=mode)
         if not decoded:
-            return False, results, decode_error
+            return False, results, "dtu->sensor", decode_error
 
         if result_key:
             results[result_key] = decoded
@@ -482,7 +605,7 @@ def _run_bundle(
         if delay_after_sec > 0:
             time.sleep(delay_after_sec)
 
-    return True, results, None
+    return True, results, None, None
 
 
 def read_ht(dev_eui: str) -> Dict[str, Any]:
@@ -490,13 +613,16 @@ def read_ht(dev_eui: str) -> Dict[str, Any]:
     profile = HumidityTempSensor()
     try:
         token = get_token()
+    except Exception as e:
+        return _error_result(str(e), "client->server")
+    try:
         steps = ["read"]
-        ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
+        ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
-            return _error_result(error or "Bundle failed")
+            return _error_result(error or "Bundle failed", error_stage or "client->server")
         return _result(True, data=bundle_results["reading"])
     except Exception as e:
-        return _error_result(str(e))
+        return _error_result(str(e), "client->server")
 
 
 def read_ta(dev_eui: str) -> Dict[str, Any]:
@@ -504,17 +630,20 @@ def read_ta(dev_eui: str) -> Dict[str, Any]:
     profile = HWT901BSensor()
     try:
         token = get_token()
+    except Exception as e:
+        return _error_result(str(e), "client->server")
+    try:
         steps = ["unlock", "angles", "accel"]
-        ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
+        ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
-            return _error_result(error or "Bundle failed")
+            return _error_result(error or "Bundle failed", error_stage or "client->server")
 
         combined = {}
         combined.update(bundle_results["angles"])
         combined.update(bundle_results["accel"])
         return _result(True, data=combined)
     except Exception as e:
-        return _error_result(str(e))
+        return _error_result(str(e), "client->server")
 
 
 def read_wl(dev_eui: str) -> Dict[str, Any]:
@@ -522,13 +651,16 @@ def read_wl(dev_eui: str) -> Dict[str, Any]:
     profile = WaterLevelSensor()
     try:
         token = get_token()
+    except Exception as e:
+        return _error_result(str(e), "client->server")
+    try:
         steps = ["read"]
-        ok, bundle_results, error = _run_bundle(profile, dev_eui, token, steps)
+        ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
-            return _error_result(error or "Bundle failed")
+            return _error_result(error or "Bundle failed", error_stage or "client->server")
         return _result(True, data=bundle_results["reading"])
     except Exception as e:
-        return _error_result(str(e))
+        return _error_result(str(e), "client->server")
 
 
 def read_mmwave(dev_eui: str) -> Dict[str, Any]:
@@ -536,20 +668,23 @@ def read_mmwave(dev_eui: str) -> Dict[str, Any]:
     profile = MMWaveSensor()
     try:
         token = get_token()
+    except Exception as e:
+        return _error_result(str(e), "client->server")
+    try:
         status, uplinks = pull_latest_uplinks(
             device_id=dev_eui,
             auth_token=token,
             size=10,
         )
         if status != 1 or not uplinks:
-            return _error_result("Failed to pull latest uplink")
+            return _error_result("Failed to pull latest uplink", "dtu->sensor")
         hex_data = uplinks[0]["hex"]
         targets = profile.decode_targets(hex_data)
         if not targets:
-            return _error_result("No targets detected or failed to decode")
+            return _error_result("No targets detected or failed to decode", "dtu->sensor")
         return _result(True, data={"targets": targets})
     except Exception as e:
-        return _error_result(str(e))
+        return _error_result(str(e), "client->server")
 
 
 # Start the background router as soon as this module is imported.

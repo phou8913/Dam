@@ -36,7 +36,7 @@ The main modules are:
 - `tilt_acc_sensor.py`
 - `water_level_sensor.py`
 - `mmwave_sensor.py`
-  These profile modules only handle sensor-specific command generation, response validation, and response decoding.
+  These profile modules handle sensor-specific request generation and response decoding. The request/response profiles now follow a shared `build_request(mode)` and `decode_response(data, mode)` interface.
 
 - `fake_server.py`
   Simulates the LoRa gateway HTTP API for local testing.
@@ -87,29 +87,33 @@ It only polls this shared buffer and redraws the screen from the newest result.
 
 `ht`, `wl`, and `ta` are implemented as bundled reads in `communicator.py`.
 
-A bundle is a list of ordered steps.
-Each step is stored as a dictionary.
-Current step types are:
+A bundle is now a list of ordered mode strings.
+For each mode, `communicator.py` calls:
 
-- `send_only`
-  Send a command without waiting for a response.
+- `profile.build_request(mode)`
+- `profile.decode_response(data, mode)` when a response is expected
 
-- `request_response`
-  Send a command, wait for a matching uplink, validate it, decode it, and store the decoded output under a result key.
+The bundle runner decides whether to wait for a response based on the mode:
+
+- `unlock`
+  Send the command only, then continue after a short delay.
+
+- `read`, `angles`, `accel`
+  Send the command, wait for an uplink, decode it, and store the decoded result.
 
 Examples:
 
 - `ht`
-  One-step bundle with a single request/response read.
+  One-step bundle with `["read"]`.
 
 - `wl`
-  One-step bundle with a single request/response read.
+  One-step bundle with `["read"]`.
 
 - `ta`
   Multi-step bundle:
-  1. send unlock command
-  2. request and decode angles
-  3. request and decode acceleration
+  1. `unlock`
+  2. `angles`
+  3. `accel`
 
 `mmwave` is currently handled separately because it only pulls the latest uplink and does not use the same request/response flow.
 

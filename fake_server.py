@@ -30,6 +30,7 @@ ack_lock = threading.Lock()
 # Optional knobs for testing retries and timing behavior.
 SIM_PACKET_LOSS_RATE = 0.0
 SIM_DELAY_SEC = 0.0
+FAKE_APPLICATION_ID = os.getenv("APPLICATION_ID", "18")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -160,7 +161,7 @@ def generate_fake_mmwave_hex(max_targets: int = 3) -> str:
 
 def _build_ack_event(device_id: str, reference: str) -> Dict[str, Any]:
     return {
-        "applicationID": "18",
+        "applicationID": FAKE_APPLICATION_ID,
         "applicationName": "DTU_WaterLevel_Meilun",
         "deviceName": f"FAKE_{device_id}",
         "devEUI": device_id,

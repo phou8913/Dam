@@ -4,8 +4,7 @@ Parses multi-target detection data from LoRa-connected mmWave radar.
 Data format: [Dist_Hi, Dist_Lo, Angle_Hi, Angle_Lo] per target (4 bytes each)
 """
 
-import struct
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 
 
 class MMWaveSensor:
