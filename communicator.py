@@ -15,6 +15,11 @@ try:
     import paho.mqtt.client as mqtt
 except ImportError:
     mqtt = None
+try:
+    from colorama import Fore, Style, init as colorama_init
+    colorama_init()
+except ImportError:
+    Fore = Style = None
 
 from profiles.humidity_temp_sensor import HumidityTempSensor
 from profiles.tilt_acc_sensor import HWT901BSensor
@@ -521,7 +526,12 @@ def send_and_wait(
             return 0, None, "gateway->dtu", "No ACK received"
 
         if not ack_payload.get("acknowledged", False):
-            return 0, None, "gateway->dtu", "ACK received but not acknowledged"
+            warning_message = (
+                f"Warning: ACK received for {device_id}, but acknowledged=false; continuing to wait for uplink."
+            )
+            if Fore and Style:
+                warning_message = f"{Fore.YELLOW}{warning_message}{Style.RESET_ALL}"
+            _log_line(warning_message)
 
         deadline = send_time + response_timeout_sec
         while time.time() < deadline:
@@ -559,39 +569,19 @@ def _run_bundle(
 
     for mode in steps:
         command_hex = profile.build_request(mode).hex()
-        wait_for_response = mode != "unlock"
         reference = mode
-        result_key = "reading" if mode == "read" else mode
+        result_key = mode
         wait_error = f"Failed to get response for {mode}"
         decode_error = f"Failed to decode response for {mode}"
-        send_error = f"Failed to send command for {mode}"
-        delay_after_sec = 0.5 if mode == "unlock" else 0.0
-
-        if not wait_for_response:
-            send_kwargs = {
-                "device_id": dev_eui,
-                "data_to_send": command_hex,
-                "auth_token": auth_token,
-                "fport": 1,
-                "reference": reference,
-            }
-            status, _ = send_request(**send_kwargs)
-            if status != 1:
-                return False, results, "client->server", send_error
-
-            if delay_after_sec > 0:
-                time.sleep(delay_after_sec)
-
-            continue
-
-        wait_kwargs = {
+        request_kwargs = {
             "device_id": dev_eui,
             "data_to_send": command_hex,
             "auth_token": auth_token,
             "fport": 1,
             "reference": reference,
         }
-        status, hex_data, error_stage, error_reason = send_and_wait(**wait_kwargs)
+
+        status, hex_data, error_stage, error_reason = send_and_wait(**request_kwargs)
         if status != 1 or not hex_data:
             return False, results, error_stage or "gateway->dtu", error_reason or wait_error
 
@@ -601,9 +591,6 @@ def _run_bundle(
 
         if result_key:
             results[result_key] = decoded
-
-        if delay_after_sec > 0:
-            time.sleep(delay_after_sec)
 
     return True, results, None, None
 
@@ -620,7 +607,7 @@ def read_ht(dev_eui: str) -> Dict[str, Any]:
         ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed", error_stage or "client->server")
-        return _result(True, data=bundle_results["reading"])
+        return _result(True, data=bundle_results["read"])
     except Exception as e:
         return _error_result(str(e), "client->server")
 
@@ -658,7 +645,7 @@ def read_wl(dev_eui: str) -> Dict[str, Any]:
         ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
         if not ok:
             return _error_result(error or "Bundle failed", error_stage or "client->server")
-        return _result(True, data=bundle_results["reading"])
+        return _result(True, data=bundle_results["read"])
     except Exception as e:
         return _error_result(str(e), "client->server")
 
