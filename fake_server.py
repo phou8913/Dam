@@ -223,7 +223,9 @@ def process_downlink(device_id: str, hex_data: str, fport: int):
         elif cmd == "5003003400034984":
             response_hex = generate_fake_accel_hex()
             store_uplink(device_id, response_hex, fport)
-        # Unlock command does not generate an uplink.
+        # Mirror the real DTU behavior: unlock is echoed back as an uplink.
+        elif cmd == "50060069B58822A1":
+            store_uplink(device_id, cmd, fport)
         return
     
     # Water level command family.

@@ -1,1 +1,1 @@
-"""Connectivity test package."""
+"""New test package for current communicator-based tests."""

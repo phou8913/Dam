@@ -67,6 +67,12 @@ def _log_line(message: str = ""):
     print(f"[{ts}] {message}")
 
 
+def _red_text(message: str) -> str:
+    if Fore and Style:
+        return f"{Fore.RED}{message}{Style.RESET_ALL}"
+    return message
+
+
 def _log_sensor_header(sensor: str):
     _log_line()
     print(f"--- {_SENSOR_LABELS.get(sensor, sensor)} ---")
@@ -77,7 +83,7 @@ def _log_sensor_result(sensor: str, result: Dict[str, Any]):
     if not result.get("ok"):
         stage = result.get("error_stage") or "unknown"
         reason = result.get("error") or "Unknown error"
-        _log_line(f"Error at {stage}: {reason}")
+        _log_line(_red_text(f"Error at {stage}: {reason}"))
         return
 
     if sensor == "ht":

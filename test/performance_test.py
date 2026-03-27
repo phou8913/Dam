@@ -1,89 +1,47 @@
-"""Simple performance runner for the end-to-end connectivity test."""
+"""Performance test that only imports communicator."""
 
 import argparse
+import contextlib
 import json
+import os
+import sys
 import time
 from typing import Any
+import io
 
-from connectivity_test import (
-    DEFAULT_ACCOUNT,
-    DEFAULT_APPLICATION_ID,
-    DEFAULT_DEVICE_ID,
-    DEFAULT_MQTT_CLIENT_ID,
-    DEFAULT_MQTT_HOST,
-    DEFAULT_MQTT_KEEPALIVE,
-    DEFAULT_MQTT_PASSWORD,
-    DEFAULT_MQTT_PORT,
-    DEFAULT_MQTT_USERNAME,
-    DEFAULT_PASSWORD,
-    SegmentContext,
-    run_end_to_end,
-)
-from tools.common_check import choose_base_url
+import requests
+
+WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if WORKSPACE_ROOT not in sys.path:
+    sys.path.insert(0, WORKSPACE_ROOT)
+
+import communicator
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the end-to-end test multiple times and print simple stats")
-    parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--base-url", default=choose_base_url())
-    parser.add_argument("--account", default=DEFAULT_ACCOUNT)
-    parser.add_argument("--password", default=DEFAULT_PASSWORD)
-    parser.add_argument("--device-id", default=DEFAULT_DEVICE_ID)
-    parser.add_argument("--application-id", default=DEFAULT_APPLICATION_ID)
-    parser.add_argument("--auth-timeout", type=float, default=5.0)
-    parser.add_argument("--queue-timeout", type=float, default=10.0)
-    parser.add_argument("--ack-timeout", type=float, default=20.0)
-    parser.add_argument("--uplink-timeout", type=float, default=30.0)
-    parser.add_argument("--poll-interval", type=float, default=1.0)
-    parser.add_argument("--uplink-page-size", type=int, default=20)
-    parser.add_argument("--request-data-hex", default="010400000003B00B")
-    parser.add_argument("--request-fport", type=int, default=1)
-    parser.add_argument("--mqtt-host", default=DEFAULT_MQTT_HOST)
-    parser.add_argument("--mqtt-port", type=int, default=int(DEFAULT_MQTT_PORT))
-    parser.add_argument("--mqtt-username", default=DEFAULT_MQTT_USERNAME)
-    parser.add_argument("--mqtt-password", default=DEFAULT_MQTT_PASSWORD)
-    parser.add_argument("--mqtt-client-id", default=DEFAULT_MQTT_CLIENT_ID)
-    parser.add_argument("--mqtt-keepalive", type=int, default=int(DEFAULT_MQTT_KEEPALIVE))
-    parser.add_argument("--mqtt-tls", action="store_true")
-    parser.add_argument("--verbose", action="store_true", help="Print each run result")
+    parser = argparse.ArgumentParser(description="Measure end-to-end communicator request performance")
+    parser.add_argument("--mode", default="auto", choices=["auto", "fake", "real"])
+    parser.add_argument("--sensor", default="ht", choices=["ht", "ta", "wl", "mmwave"])
+    parser.add_argument("--device-id", default="8695311000942380")
+    parser.add_argument("--rounds", type=int, default=10)
+    parser.add_argument("--timeout-sec", type=float, default=30.0)
+    parser.add_argument("--poll-interval-sec", type=float, default=0.01)
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 
-def _build_context(args: argparse.Namespace) -> SegmentContext:
-    return SegmentContext(
-        base_url=args.base_url,
-        account=args.account,
-        password=args.password,
-        device_id=args.device_id,
-        application_id=args.application_id,
-        auth_timeout=args.auth_timeout,
-        queue_timeout=args.queue_timeout,
-        ack_timeout=args.ack_timeout,
-        uplink_timeout=args.uplink_timeout,
-        poll_interval=args.poll_interval,
-        uplink_page_size=args.uplink_page_size,
-        request_data_hex=args.request_data_hex,
-        request_fport=args.request_fport,
-        reference="",
-        mqtt_host=args.mqtt_host,
-        mqtt_port=args.mqtt_port,
-        mqtt_username=args.mqtt_username,
-        mqtt_password=args.mqtt_password,
-        mqtt_client_id=args.mqtt_client_id,
-        mqtt_keepalive=args.mqtt_keepalive,
-        mqtt_tls=args.mqtt_tls,
-    )
+def _fake_server_is_up() -> bool:
+    try:
+        response = requests.get("http://127.0.0.1:5000/health", timeout=1.0)
+        return response.ok
+    except requests.RequestException:
+        return False
 
 
-def _get_ms(result: dict, *path: str) -> float | None:
-    current = result
-    for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    if isinstance(current, (int, float)):
-        return float(current)
-    return None
+def _resolve_mode(requested_mode: str) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+    return "fake" if _fake_server_is_up() else "real"
 
 
 def _average(values: list[float]) -> float | None:
@@ -110,9 +68,8 @@ def _p95(values: list[float]) -> float | None:
     return round(ordered[index], 2)
 
 
-def _stats(values: list[float | None]) -> dict[str, float | None]:
-    numbers = [value for value in values if value is not None]
-    if not numbers:
+def _stats(values: list[float]) -> dict[str, float | None]:
+    if not values:
         return {
             "mean_ms": None,
             "median_ms": None,
@@ -121,55 +78,119 @@ def _stats(values: list[float | None]) -> dict[str, float | None]:
             "max_ms": None,
         }
     return {
-        "mean_ms": _average(numbers),
-        "median_ms": _median(numbers),
-        "p95_ms": _p95(numbers),
-        "min_ms": round(min(numbers), 2),
-        "max_ms": round(max(numbers), 2),
+        "mean_ms": _average(values),
+        "median_ms": _median(values),
+        "p95_ms": _p95(values),
+        "min_ms": round(min(values), 2),
+        "max_ms": round(max(values), 2),
+    }
+
+
+def _failure_breakdown(rounds: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in rounds:
+        if item.get("ok"):
+            continue
+        stage = item.get("error_stage") or "unknown"
+        counts[stage] = counts.get(stage, 0) + 1
+    return counts
+
+
+def _wait_for_fresh_result(
+    device_id: str,
+    sensor: str,
+    started_at: float,
+    timeout_sec: float,
+    poll_interval_sec: float,
+) -> dict[str, Any] | None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        result = communicator.get_buffer_data(device_id, sensor)
+        if result and result.get("timestamp", 0) > started_at:
+            return result
+        time.sleep(poll_interval_sec)
+    return None
+
+
+def _run_one_round(
+    device_id: str,
+    sensor: str,
+    timeout_sec: float,
+    poll_interval_sec: float,
+    quiet: bool,
+) -> dict[str, Any]:
+    started = time.time()
+    if quiet:
+        with contextlib.redirect_stdout(io.StringIO()):
+            communicator.enqueue_request(device_id, sensor)
+            result = _wait_for_fresh_result(device_id, sensor, started, timeout_sec, poll_interval_sec)
+    else:
+        communicator.enqueue_request(device_id, sensor)
+        result = _wait_for_fresh_result(device_id, sensor, started, timeout_sec, poll_interval_sec)
+    elapsed_ms = round((time.time() - started) * 1000, 2)
+
+    if result is None:
+        return {
+            "ok": False,
+            "elapsed_ms": elapsed_ms,
+            "error_stage": "timeout",
+            "error": "Timed out waiting for communicator buffer update",
+        }
+
+    return {
+        "ok": bool(result.get("ok")),
+        "elapsed_ms": elapsed_ms,
+        "error_stage": result.get("error_stage"),
+        "error": result.get("error"),
+        "result": result,
     }
 
 
 def main() -> int:
     args = _parse_args()
-    ctx = _build_context(args)
-    runs: list[dict[str, Any]] = []
-    total_times: list[float] = []
+    selected_mode = _resolve_mode(args.mode)
+    communicator.configure_backend(selected_mode)
 
-    for index in range(1, args.runs + 1):
-        started = time.time()
-        result = run_end_to_end(ctx, verbose=True)
-        total_times.append(round((time.time() - started) * 1000, 2))
-        runs.append(result)
+    rounds: list[dict[str, Any]] = []
+    elapsed_values: list[float] = []
+    bench_started = time.time()
+
+    for index in range(1, args.rounds + 1):
+        round_result = _run_one_round(
+            device_id=args.device_id,
+            sensor=args.sensor,
+            timeout_sec=args.timeout_sec,
+            poll_interval_sec=args.poll_interval_sec,
+            quiet=not args.verbose,
+        )
+        rounds.append(round_result)
+        elapsed_values.append(round_result["elapsed_ms"])
+
         if args.verbose:
-            print(f"Run {index}:")
-            print(json.dumps(result, indent=2))
+            print(f"Round {index}:")
+            print(json.dumps(round_result, indent=2))
 
-    passed = sum(1 for run in runs if run.get("result") == "PASS")
-    # Time from sending the auth request to receiving the auth response.
-    auth_times = [_get_ms(run, "auth", "elapsed_ms") for run in runs]
-    # Time from sending the queue request to receiving the queue response.
-    queue_times = [_get_ms(run, "client_server", "queue", "elapsed_ms") for run in runs]
-    # Time from queue submission to receiving the ACK result.
-    ack_times = [_get_ms(run, "gateway_dtu", "ack", "elapsed_ms") for run in runs]
-    # Time for the final uplink poll HTTP request itself.
-    uplink_poll_times = [_get_ms(run, "dtu_sensor", "uplink", "last_poll", "elapsed_ms") for run in runs]
+    total_elapsed_sec = max(time.time() - bench_started, 0.0001)
+    passed = sum(1 for item in rounds if item.get("ok"))
+    failed = args.rounds - passed
 
     summary = {
-        "runs": args.runs,
-        "base_url": args.base_url,
+        "mode": selected_mode,
+        "mode_requested": args.mode,
+        "sensor": args.sensor,
+        "device_id": args.device_id,
+        "rounds": args.rounds,
         "passed": passed,
-        "failed": args.runs - passed,
-        "success_rate": f"{round((passed / args.runs) * 100, 2)}%" if args.runs else "0%",
-        "total_ms": _stats(total_times),
-        "auth_ms": _stats(auth_times),
-        "queue_ms": _stats(queue_times),
-        "ack_ms": _stats(ack_times),
-        "last_uplink_poll_ms": _stats(uplink_poll_times),
-        "notes": "Use --verbose if you want to see every run result.",
+        "failed": failed,
+        "failure_breakdown": _failure_breakdown(rounds),
+        "success_rate": f"{round((passed / args.rounds) * 100, 2)}%" if args.rounds else "0%",
+        "latency_ms": _stats(elapsed_values),
+        "throughput_rps": round(args.rounds / total_elapsed_sec, 2),
+        "notes": "Measures time from communicator.enqueue_request() to fresh buffer result.",
     }
 
     print(json.dumps(summary, indent=2))
-    return 0 if passed == args.runs else 1
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
