@@ -31,10 +31,13 @@ class HumidityTempSensor(SensorProfile):
                 return None
 
         try:
+            expected_crc = crc16_modbus(data[:-2])
+            actual_crc = int.from_bytes(data[-2:], byteorder="little")
             return {
                 "temperature_c": struct.unpack(">h", data[3:5])[0] / 100,
                 "humidity_rh": struct.unpack(">h", data[5:7])[0] / 100,
                 "dewpoint_c": struct.unpack(">h", data[7:9])[0] / 100,
+                "crc_valid": actual_crc == expected_crc,
                 "raw_hex": data.hex()
             }
         except Exception as e:

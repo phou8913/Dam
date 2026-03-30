@@ -139,12 +139,16 @@ class SensorDashboard:
         self.ta_az = ttk.Label(frame, text="--", font=("Arial", 11, "bold"))
         self.ta_az.grid(row=6, column=1, sticky=tk.W, padx=5)
 
-        ttk.Label(frame, text="Raw:").grid(row=7, column=0, sticky=tk.W, padx=5)
+        ttk.Label(frame, text="CRC:").grid(row=7, column=0, sticky=tk.W, padx=5)
+        self.ta_crc = ttk.Label(frame, text="--", foreground="gray")
+        self.ta_crc.grid(row=7, column=1, sticky=tk.W, padx=5)
+
+        ttk.Label(frame, text="Raw:").grid(row=8, column=0, sticky=tk.W, padx=5)
         self.ta_raw = ttk.Label(frame, text="--", foreground="gray", wraplength=500)
-        self.ta_raw.grid(row=7, column=1, columnspan=2, sticky=tk.W, padx=5)
+        self.ta_raw.grid(row=8, column=1, columnspan=2, sticky=tk.W, padx=5)
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=8, column=0, columnspan=3, pady=10)
+        button_row.grid(row=9, column=0, columnspan=3, pady=10)
 
         ttk.Button(
             button_row,
@@ -320,6 +324,7 @@ class SensorDashboard:
         self.ta_ax.config(text=f"{data.get('ax_g', 0.0):.3f}g")
         self.ta_ay.config(text=f"{data.get('ay_g', 0.0):.3f}g")
         self.ta_az.config(text=f"{data.get('az_g', 0.0):.3f}g")
+        self.ta_crc.config(text=str(data.get("crc_valid", "--")))
         self.ta_raw.config(text=data.get("raw_hex", "--"))
 
     def update_wl_display(self, data):

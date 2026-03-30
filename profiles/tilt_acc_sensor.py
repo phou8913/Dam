@@ -2,6 +2,7 @@ import struct
 from typing import Optional, Dict, Any
 
 from .base import SensorProfile
+from .modbus_utils import crc16_modbus
 
 
 class HWT901BSensor(SensorProfile):
@@ -26,11 +27,14 @@ class HWT901BSensor(SensorProfile):
                 return None
 
         try:
+            expected_crc = crc16_modbus(data[:-2])
+            actual_crc = int.from_bytes(data[-2:], byteorder="little")
             if mode == "angles":
                 return {
                     "roll": struct.unpack(">h", data[3:5])[0] / 32768 * 180,
                     "pitch": struct.unpack(">h", data[5:7])[0] / 32768 * 180,
                     "yaw": struct.unpack(">h", data[7:9])[0] / 32768 * 180,
+                    "crc_valid": actual_crc == expected_crc,
                     "raw_hex": data.hex()
                 }
 
@@ -39,6 +43,7 @@ class HWT901BSensor(SensorProfile):
                     "ax_g": struct.unpack(">h", data[3:5])[0] / 32768 * 16,
                     "ay_g": struct.unpack(">h", data[5:7])[0] / 32768 * 16,
                     "az_g": struct.unpack(">h", data[7:9])[0] / 32768 * 16,
+                    "crc_valid": actual_crc == expected_crc,
                     "raw_hex": data.hex()
                 }
 

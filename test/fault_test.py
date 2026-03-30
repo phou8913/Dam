@@ -82,6 +82,7 @@ def _run_case(case: dict[str, object]) -> None:
             server.kill()
             server.wait(timeout=5)
         time.sleep(0.2)
+        print()
 
 
 def main() -> int:

@@ -31,8 +31,11 @@ class WaterLevelSensor(SensorProfile):
                 return None
 
         try:
+            expected_crc = crc16_modbus(data[:-2])
+            actual_crc = int.from_bytes(data[-2:], byteorder="little")
             return {
                 "level_m": struct.unpack(">f", data[3:7])[0],
+                "crc_valid": actual_crc == expected_crc,
                 "raw_hex": data.hex()
             }
         except Exception as e:

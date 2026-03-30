@@ -67,6 +67,7 @@ def _log_line(message: str = ""):
     print(f"[{ts}] {message}")
 
 
+# When erroring, display the message in red
 def _red_text(message: str) -> str:
     if Fore and Style:
         return f"{Fore.RED}{message}{Style.RESET_ALL}"
@@ -99,6 +100,7 @@ def _log_sensor_result(sensor: str, result: Dict[str, Any]):
         _log_line(f"Ax: {data.get('ax_g', 0.0):.3f}g ({data.get('ax_ms2', 0.0):.2f} m/s²)")
         _log_line(f"Ay: {data.get('ay_g', 0.0):.3f}g ({data.get('ay_ms2', 0.0):.2f} m/s²)")
         _log_line(f"Az: {data.get('az_g', 0.0):.3f}g ({data.get('az_ms2', 0.0):.2f} m/s²)")
+        _log_line(f"CRC Valid: {data.get('crc_valid', '--')}")
         _log_line(f"Raw: {data.get('raw_hex', '--')}")
     elif sensor == "wl":
         _log_line(f"Water Level: {data.get('level_m', 0.0):.3f} m")
@@ -313,6 +315,9 @@ def get_token() -> str:
         if not token:
             raise RuntimeError("Authentication successful but no token received")
         return token
+    except requests.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "unknown"
+        raise RuntimeError(f"Failed to authenticate: {status_code}")
     except Exception as e:
         raise RuntimeError(f"Failed to authenticate: {e}")
 
@@ -506,7 +511,7 @@ def send_and_wait(
     device_id: str,
     data_to_send: str,
     auth_token: str,
-    response_timeout_sec: float = 10.0, ### recommend for real environment: 10.0        Extreme: 1.0 for testing
+    response_timeout_sec: float = 20.0, ### recommend for real environment: 20.0        Extreme: 1.0 for testing
     fport: int = 1,
     reference: str = "downlink-cmd",
     poll_interval_sec: float = 0.5, ### recommend for real environment: 0.5          Extreme: 0.01 for testing
@@ -532,12 +537,13 @@ def send_and_wait(
             return 0, None, "gateway->dtu", "No ACK received"
 
         if not ack_payload.get("acknowledged", False):
-            warning_message = (
-                f"Warning: ACK received for {device_id}, but acknowledged=false; continuing to wait for uplink."
-            )
-            if Fore and Style:
-                warning_message = f"{Fore.YELLOW}{warning_message}{Style.RESET_ALL}"
-            _log_line(warning_message)
+            # warning_message = (
+            #     f"Warning: ACK received for {device_id}, but acknowledged=false; continuing to wait for uplink."
+            # )
+            # if Fore and Style:
+            #     warning_message = f"{Fore.YELLOW}{warning_message}{Style.RESET_ALL}"
+            # _log_line(warning_message)
+            pass
 
         deadline = send_time + response_timeout_sec
         while time.time() < deadline:
@@ -597,6 +603,8 @@ def _run_bundle(
 
         if result_key:
             results[result_key] = decoded
+
+        time.sleep(5)
 
     return True, results, None, None
 
