@@ -195,3 +195,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+### python test/performance_test.py --mode real --sensor ta --rounds 5 --verbose

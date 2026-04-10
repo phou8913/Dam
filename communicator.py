@@ -3,6 +3,7 @@ LoRa API communicator with per-device request queues and latest-result buffer.
 """
 
 import os
+import socket
 import time
 import threading
 import queue
@@ -30,14 +31,14 @@ from profiles.mmwave_sensor import MMWaveSensor
 # Backend mode and connection settings.
 USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
 
-REAL_BASE_URL = "http://99.10.226.29:4560/api"
+REAL_BASE_URL = "http://99.10.226.29:4560/api" ### correct: http://99.10.226.29:4560/api
 FAKE_BASE_URL = "http://127.0.0.1:5000/api"
 APPLICATION_ID = os.getenv("APPLICATION_ID", "18")
 
-MQTT_HOST = os.getenv("MQTT_HOST", "99.10.226.29")
+MQTT_HOST = os.getenv("MQTT_HOST", "99.10.226.29")  ### correct: 99.10.226.29
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "mqtt_user_1")
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "mqtt_pass_1")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "mqtt_pass_1") 
 MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "mqtt_client_1")
 MQTT_KEEPALIVE = int(os.getenv("MQTT_KEEPALIVE", "60"))
 
@@ -51,6 +52,14 @@ DEFAULT_BASE_URL = _default_base_url(USE_FAKE_SERVER)
 BASE_URL = os.getenv("BASE_URL", DEFAULT_BASE_URL)
 ACCOUNT = os.getenv("LORA_ACCOUNT", "admin")
 PASSWORD = os.getenv("LORA_PASSWORD", "admin")
+
+
+def _network_seems_offline(timeout_sec: float = 1.0) -> bool:
+    try:
+        with socket.create_connection(("8.8.8.8", 53), timeout=timeout_sec):
+            return False
+    except OSError:
+        return True
 
 
 # Terminal logging helpers for queued requests and sensor results.
@@ -318,6 +327,10 @@ def get_token() -> str:
     except requests.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else "unknown"
         raise RuntimeError(f"Failed to authenticate: {status_code}")
+    except requests.ConnectionError:
+        if _network_seems_offline():
+            raise RuntimeError("Failed to authenticate: network offline")
+        raise RuntimeError("Failed to authenticate: platform unreachable")
     except Exception as e:
         raise RuntimeError(f"Failed to authenticate: {e}")
 
@@ -424,7 +437,7 @@ def send_request(
     reference: str = "downlink-cmd",
     request_interval_sec: float = 1.0, ### recommend for real environment: 1.0     Extreme: 0.0 for testing
     http_timeout_sec: float = 5.0, ### recommend for real environment: 5.0         Extreme: 1.0 for testing
-) -> Tuple[int, Optional[Any]]:
+) -> Tuple[int, Optional[Any], Optional[str]]:
     # Enforce minimum spacing so repeated downlinks do not pile up too quickly.
     send_lock = _get_send_lock(device_id)
     with send_lock:
@@ -453,10 +466,14 @@ def send_request(
                 timeout=http_timeout_sec,
             )
             response.raise_for_status()
-            return 1, response.json()
+            return 1, response.json(), None
+        except requests.HTTPError as e:
+            print(f"Error sending request: {e}")
+            status_code = e.response.status_code if e.response is not None else "unknown"
+            return 0, None, f"Failed to send request: {status_code}"
         except Exception as e:
             print(f"Error sending request: {e}")
-            return 0, None
+            return 0, None, "Failed to send request"
 
 
 def pull_latest_uplinks(
@@ -511,7 +528,7 @@ def send_and_wait(
     device_id: str,
     data_to_send: str,
     auth_token: str,
-    response_timeout_sec: float = 20.0, ### recommend for real environment: 20.0        Extreme: 1.0 for testing
+    response_timeout_sec: float = 15.0, ### recommend for real environment: 15.0        Extreme: 1.0 for testing
     fport: int = 1,
     reference: str = "downlink-cmd",
     poll_interval_sec: float = 0.5, ### recommend for real environment: 0.5          Extreme: 0.01 for testing
@@ -521,7 +538,7 @@ def send_and_wait(
     lock = _get_inflight_lock(device_id)
     with lock:
         send_time = time.time()
-        status, _ = send_request(
+        status, _, send_error = send_request(
             device_id,
             data_to_send,
             auth_token,
@@ -530,7 +547,7 @@ def send_and_wait(
         )
         if status != 1:
             print(f"[send_and_wait] Failed to send request to {device_id}")
-            return 0, None, "client->server", "Failed to send request"
+            return 0, None, "client->server", send_error or "Failed to send request"
 
         ack_status, ack_payload = get_ack(device_id, timeout_sec=response_timeout_sec)
         if ack_status != 1 or ack_payload is None:

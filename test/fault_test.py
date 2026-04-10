@@ -51,7 +51,7 @@ def _wait_for_server(timeout_sec: float = 5.0) -> bool:
     return False
 
 
-def _wait_for_result(started_at: float, timeout_sec: float = 15.0):
+def _wait_for_result(started_at: float, timeout_sec: float = 16.0):
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         result = communicator.get_buffer_data(DEVICE_ID, SENSOR)
