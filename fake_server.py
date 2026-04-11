@@ -24,13 +24,10 @@ app = Flask(__name__)
 # In-memory uplink history keyed by device ID.
 device_uplinks: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 uplinks_lock = threading.Lock()
-device_ack_events: Dict[str, Dict[str, Any]] = {}
-ack_lock = threading.Lock()
 
 # Optional knobs for testing retries and timing behavior.
 SIM_PACKET_LOSS_RATE = 0.0
 SIM_DELAY_SEC = 0.0
-FAKE_APPLICATION_ID = os.getenv("APPLICATION_ID", "18")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -46,14 +43,6 @@ def _fake_auth_ok() -> bool:
 
 def _fake_queue_ok() -> bool:
     return _env_bool("FAKE_QUEUE_OK", True)
-
-
-def _fake_ack_enabled() -> bool:
-    return _env_bool("FAKE_ACK_ENABLED", True)
-
-
-def _fake_acknowledged() -> bool:
-    return _env_bool("FAKE_ACKNOWLEDGED", True)
 
 
 def _fake_uplink_enabled() -> bool:
@@ -157,24 +146,6 @@ def generate_fake_mmwave_hex(max_targets: int = 3) -> str:
         angle_raw = int(angle_deg * 100)
         payload += struct.pack(">Hh", distance_raw, angle_raw)
     return payload.hex()
-
-
-def _build_ack_event(device_id: str, reference: str) -> Dict[str, Any]:
-    return {
-        "applicationID": FAKE_APPLICATION_ID,
-        "applicationName": "DTU_WaterLevel_Meilun",
-        "deviceName": f"FAKE_{device_id}",
-        "devEUI": device_id,
-        "acknowledged": _fake_acknowledged(),
-        "reference": reference,
-        "fCnt": int(time.time()),
-        "insertTime": generate_timestamp(),
-    }
-
-
-def store_ack_event(device_id: str, reference: str):
-    with ack_lock:
-        device_ack_events[device_id] = _build_ack_event(device_id, reference)
 
 
 def _sensor_response_hex_for_mode(mode: str) -> str | None:
@@ -311,30 +282,11 @@ def send_downlink(device_id: str):
     else:
         process_downlink(device_id, hex_data, fport)
 
-    if _fake_ack_enabled():
-        if SIM_DELAY_SEC > 0 and random.random() < 0.3:
-            def delayed_ack():
-                time.sleep(SIM_DELAY_SEC)
-                store_ack_event(device_id, reference)
-            threading.Thread(target=delayed_ack, daemon=True).start()
-        else:
-            store_ack_event(device_id, reference)
-    
     return jsonify({
         "status": "success",
         "device_id": device_id,
         "reference": reference
     }), 200
-
-
-@app.route('/api/v1/devices/<device_id>/ack', methods=['GET'])
-def get_ack(device_id: str):
-    """Retrieve the latest fake ack result for a device."""
-    with ack_lock:
-        ack_event = device_ack_events.get(device_id)
-    if ack_event is None:
-        return jsonify({"error": "Ack not found"}), 404
-    return jsonify(ack_event), 200
 
 
 @app.route('/api/v1/uplink-storage/devices/<device_id>/uplink', methods=['GET'])
@@ -377,7 +329,6 @@ if __name__ == '__main__':
     print("\nEndpoints:")
     print("  POST /api/v1/internal/auth")
     print("  POST /api/v1/devices/<device_id>/queue")
-    print("  GET  /api/v1/devices/<device_id>/ack")
     print("  GET  /api/v1/uplink-storage/devices/<device_id>/uplink")
     print("  GET  /health")
     print("=" * 60)
