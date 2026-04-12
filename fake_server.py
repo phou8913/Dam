@@ -49,6 +49,10 @@ def _fake_uplink_enabled() -> bool:
     return _env_bool("FAKE_UPLINK_ENABLED", True)
 
 
+def _fake_gateway_online() -> bool:
+    return _env_bool("FAKE_GATEWAY_ONLINE", True)
+
+
 def _fake_sensor_match() -> str:
     return os.getenv("FAKE_SENSOR_MATCH", "").strip().lower()
 
@@ -57,6 +61,17 @@ def generate_timestamp() -> str:
     """Generate ISO 8601 timestamp string."""
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def generate_gateway_last_seen() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    if _fake_gateway_online():
+        seen_at = now
+    else:
+        seen_at = now - timedelta(minutes=10)
+    return seen_at.isoformat().replace("+00:00", "Z")
 
 
 def hex_to_base64(hex_str: str) -> str:
@@ -308,6 +323,16 @@ def get_uplinks(device_id: str):
     }), 200
 
 
+@app.route('/api/v1/gateways/<gateway_id>', methods=['GET'])
+def get_gateway(gateway_id: str):
+    return jsonify({
+        "gateway": {
+            "id": gateway_id,
+            "lastSeenAt": generate_gateway_last_seen(),
+        }
+    }), 200
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint."""
@@ -330,6 +355,7 @@ if __name__ == '__main__':
     print("  POST /api/v1/internal/auth")
     print("  POST /api/v1/devices/<device_id>/queue")
     print("  GET  /api/v1/uplink-storage/devices/<device_id>/uplink")
+    print("  GET  /api/v1/gateways/<gateway_id>")
     print("  GET  /health")
     print("=" * 60)
     

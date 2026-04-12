@@ -29,6 +29,7 @@ USE_FAKE_SERVER = os.getenv("USE_FAKE_SERVER") == "1"
 
 REAL_BASE_URL = "http://99.10.226.29:4560/api" ### correct: http://99.10.226.29:4560/api
 FAKE_BASE_URL = "http://127.0.0.1:5000/api"
+GATEWAY_ID = os.getenv("GATEWAY_ID", "a869529031597659")
 
 
 def _default_base_url(use_fake_server: bool) -> str:
@@ -73,7 +74,7 @@ def _red_text(message: str) -> str:
 
 def _log_sensor_header(sensor: str):
     _log_line()
-    print(f"--- {_SENSOR_LABELS.get(sensor, sensor)} ---")
+    _log_line(f"--- {_SENSOR_LABELS.get(sensor, sensor)} ---")
 
 
 def _log_sensor_result(sensor: str, result: Dict[str, Any]):
@@ -156,6 +157,13 @@ def _result(
 
 def _error_result(error: str, error_stage: str) -> Dict[str, Any]:
     return _result(False, data=None, error=error, error_stage=error_stage)
+
+
+class KnownStageError(Exception):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
 
 
 # Backend selection and shared buffer helpers.
@@ -258,10 +266,15 @@ def _handle_request(task: Dict[str, Any]):
     if reader is None:
         result = _error_result(f"Unsupported sensor: {sensor}", "client->server")
     else:
-        result = reader(dev_eui)
+        try:
+            result = reader(dev_eui)
+        except KnownStageError as e:
+            result = _error_result(e.message, e.stage)
+        except Exception as e:
+            result = _error_result(str(e), "unknown")
 
     _write_buffer_result(dev_eui, sensor, result)
-    print(f"[_DeviceWorker:{dev_eui}] Updated buffer {sensor} ok={result.get('ok', False)}")
+    _log_line(f"[_DeviceWorker:{dev_eui}] Updated buffer {sensor} ok={result.get('ok', False)}")
     _log_sensor_result(sensor, result)
 
 
@@ -310,22 +323,53 @@ def get_token() -> str:
         response.raise_for_status()
         token = response.json().get("token")
         if not token:
-            raise RuntimeError("Authentication successful but no token received")
+            raise KnownStageError("client->server", "Authentication successful but no token received")
         return token
     except requests.HTTPError as e:
         status_code = e.response.status_code if e.response is not None else "unknown"
-        raise RuntimeError(f"Failed to authenticate: {status_code}")
+        raise KnownStageError("client->server", f"Failed to authenticate: {status_code}")
     except requests.ConnectionError:
         if _network_seems_offline():
-            raise RuntimeError("Failed to authenticate: network offline")
-        raise RuntimeError("Failed to authenticate: platform unreachable")
+            raise KnownStageError("client->server", "Failed to authenticate: network offline")
+        raise KnownStageError("client->server", "Failed to authenticate: platform unreachable")
     except Exception as e:
-        raise RuntimeError(f"Failed to authenticate: {e}")
+        if isinstance(e, KnownStageError):
+            raise
+        raise KnownStageError("client->server", f"Failed to authenticate: {e}")
 
 
-def get_ack(device_id: str, timeout_sec: float = 10.0) -> Tuple[int, Optional[Dict[str, Any]]]:
+def get_gateway_last_seen(
+    gateway_id: str,
+    auth_token: str,
+    max_age_sec: int = 120,
+) -> str:
+    url = f"{BASE_URL}/v1/gateways/{gateway_id}"
+    headers = {"token": auth_token}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=5.0)
+        response.raise_for_status()
+        body = response.json()
+        last_seen = body.get("gateway", {}).get("lastSeenAt")
+        if not last_seen:
+            raise KnownStageError("server->gateway", "Gateway lastSeenAt not found")
+
+        seen_ts = datetime.fromisoformat(last_seen.replace("Z", "+00:00")).timestamp()
+        if time.time() - seen_ts > max_age_sec:
+            raise KnownStageError("server->gateway", f"Gateway appears offline (lastSeenAt={last_seen})")
+        return last_seen
+    except requests.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "unknown"
+        raise KnownStageError("server->gateway", f"Failed to get gateway: {status_code}")
+    except Exception as e:
+        if isinstance(e, KnownStageError):
+            raise
+        raise KnownStageError("server->gateway", f"Failed to get gateway: {e}")
+
+
+def get_ack(device_id: str, timeout_sec: float = 10.0) -> Dict[str, Any]:
     # ACK handling is intentionally a no-op placeholder.
-    return 1, {"acknowledged": True, "device_id": device_id, "stub": True}
+    return {"acknowledged": True, "device_id": device_id, "stub": True}
 
 
 def send_request(
@@ -336,7 +380,7 @@ def send_request(
     reference: str = "downlink-cmd",
     request_interval_sec: float = 1.0, ### recommend for real environment: 1.0     Extreme: 0.0 for testing
     http_timeout_sec: float = 5.0, ### recommend for real environment: 5.0         Extreme: 1.0 for testing
-) -> Tuple[int, Optional[Any], Optional[str]]:
+) -> Any:
     # Enforce minimum spacing so repeated downlinks do not pile up too quickly.
     send_lock = _get_send_lock(device_id)
     with send_lock:
@@ -365,21 +409,21 @@ def send_request(
                 timeout=http_timeout_sec,
             )
             response.raise_for_status()
-            return 1, response.json(), None
+            return response.json()
         except requests.HTTPError as e:
-            print(f"Error sending request: {e}")
+            _log_line(f"Error sending request: {e}")
             status_code = e.response.status_code if e.response is not None else "unknown"
-            return 0, None, f"Failed to send request: {status_code}"
+            raise KnownStageError("client->server", f"Failed to send request: {status_code}")
         except Exception as e:
-            print(f"Error sending request: {e}")
-            return 0, None, "Failed to send request"
+            _log_line(f"Error sending request: {e}")
+            raise KnownStageError("client->server", "Failed to send request")
 
 
 def pull_latest_uplinks(
     device_id: str,
     auth_token: str,
     size: int = 10,
-) -> Tuple[int, Optional[List[Dict[str, Any]]]]:
+) -> List[Dict[str, Any]]:
     try:
         url = f"{BASE_URL}/v1/uplink-storage/devices/{device_id}/uplink"
         headers = {"token": auth_token}
@@ -398,7 +442,7 @@ def pull_latest_uplinks(
                 try:
                     ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
                 except Exception as e:
-                    print(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
+                    _log_line(f"Warning: Failed to parse insertTime '{ts_str}': {e}")
                     ts = time.time()
             else:
                 ts = time.time()
@@ -413,14 +457,12 @@ def pull_latest_uplinks(
                         "raw": uplink,
                     })
                 except Exception as e:
-                    print(f"Warning: Failed to decode uplink: {e}")
+                    _log_line(f"Warning: Failed to decode uplink: {e}")
 
-        if uplinks:
-            return 1, uplinks
-        return 0, None
+        return uplinks
     except Exception as e:
-        print(f"Error pulling uplinks: {e}")
-        return 0, None
+        _log_line(f"Error pulling uplinks: {e}")
+        raise KnownStageError("dtu->sensor", "Failed to pull latest uplink")
 
 
 def send_and_wait(
@@ -431,33 +473,27 @@ def send_and_wait(
     fport: int = 1,
     reference: str = "downlink-cmd",
     poll_interval_sec: float = 0.5, ### recommend for real environment: 0.5          Extreme: 0.01 for testing
-) -> Tuple[int, Optional[str], Optional[str], Optional[str]]:
+) -> str:
     # For request/response sensors, send a command and wait for the next matching uplink.
     freshness_slack_sec = 0.01
     lock = _get_inflight_lock(device_id)
     with lock:
         send_time = time.time()
-        status, _, send_error = send_request(
+        get_gateway_last_seen(GATEWAY_ID, auth_token)
+        send_request(
             device_id,
             data_to_send,
             auth_token,
             fport,
             reference,
         )
-        if status != 1:
-            print(f"[send_and_wait] Failed to send request to {device_id}")
-            return 0, None, "client->server", send_error or "Failed to send request"
-
-        ack_status, ack_payload = get_ack(device_id, timeout_sec=response_timeout_sec)
-        if ack_status != 1 or ack_payload is None:
-            return 0, None, "gateway->dtu", "ACK placeholder failed"
+        ## Just placeholder. No real usage.
+        get_ack(device_id, timeout_sec=response_timeout_sec)
 
         deadline = send_time + response_timeout_sec
         while time.time() < deadline:
             time.sleep(poll_interval_sec)
-            status, uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
-            if status != 1 or uplinks is None:
-                continue
+            uplinks = pull_latest_uplinks(device_id, auth_token, size=20)
 
             for uplink in uplinks:
                 with _RESPONSE_TS_LOCK:
@@ -471,10 +507,10 @@ def send_and_wait(
                     if uplink["ts"] <= _LAST_RESPONSE_TS.get(device_id, 0.0):
                         continue
                     _LAST_RESPONSE_TS[device_id] = uplink["ts"]
-                return 1, hex_data, None, None
+                return hex_data
 
-        print(f"[send_and_wait] Timeout waiting for response from {device_id}")
-        return 0, None, "dtu->sensor", "No uplink received after ACK"
+        _log_line(f"[send_and_wait] Timeout waiting for response from {device_id}")
+        raise KnownStageError("dtu->sensor", "No uplink received")
 
 
 # Run bundled sensor steps that must stay in sequence.
@@ -483,15 +519,13 @@ def _run_bundle(
     dev_eui: str,
     auth_token: str,
     steps: List[str],
-) -> Tuple[bool, Dict[str, Any], Optional[str], Optional[str]]:
+) -> Dict[str, Any]:
     results: Dict[str, Any] = {}
 
     for mode in steps:
         command_hex = profile.build_request(mode).hex()
         reference = mode
         result_key = mode
-        wait_error = f"Failed to get response for {mode}"
-        decode_error = f"Failed to decode response for {mode}"
         request_kwargs = {
             "device_id": dev_eui,
             "data_to_send": command_hex,
@@ -500,99 +534,63 @@ def _run_bundle(
             "reference": reference,
         }
 
-        status, hex_data, error_stage, error_reason = send_and_wait(**request_kwargs)
-        if status != 1 or not hex_data:
-            return False, results, error_stage or "gateway->dtu", error_reason or wait_error
+        hex_data = send_and_wait(**request_kwargs)
 
         decoded = profile.decode_response(hex_data, mode=mode)
         if not decoded:
-            return False, results, "dtu->sensor", decode_error
+            raise KnownStageError("dtu->sensor", f"Failed to decode response for {mode}")
 
         if result_key:
             results[result_key] = decoded
 
         time.sleep(5)
 
-    return True, results, None, None
+    return results
 
 
 def read_ht(dev_eui: str) -> Dict[str, Any]:
     # Request and decode one humidity/temperature sample.
     profile = HumidityTempSensor()
-    try:
-        token = get_token()
-    except Exception as e:
-        return _error_result(str(e), "client->server")
-    try:
-        steps = ["read"]
-        ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
-        if not ok:
-            return _error_result(error or "Bundle failed", error_stage or "client->server")
-        return _result(True, data=bundle_results["read"])
-    except Exception as e:
-        return _error_result(str(e), "client->server")
+    token = get_token()
+    bundle_results = _run_bundle(profile, dev_eui, token, ["read"])
+    return _result(True, data=bundle_results["read"])
 
 
 def read_ta(dev_eui: str) -> Dict[str, Any]:
     # IMU reads bundle an unlock step with separate angle and acceleration reads.
     profile = HWT901BSensor()
-    try:
-        token = get_token()
-    except Exception as e:
-        return _error_result(str(e), "client->server")
-    try:
-        steps = ["unlock", "angles", "accel"]
-        ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
-        if not ok:
-            return _error_result(error or "Bundle failed", error_stage or "client->server")
-
-        combined = {}
-        combined.update(bundle_results["angles"])
-        combined.update(bundle_results["accel"])
-        return _result(True, data=combined)
-    except Exception as e:
-        return _error_result(str(e), "client->server")
+    token = get_token()
+    bundle_results = _run_bundle(profile, dev_eui, token, ["unlock", "angles", "accel"])
+    combined = {}
+    combined.update(bundle_results["angles"])
+    combined.update(bundle_results["accel"])
+    return _result(True, data=combined)
 
 
 def read_wl(dev_eui: str) -> Dict[str, Any]:
     # Request and decode one water level sample.
     profile = WaterLevelSensor()
-    try:
-        token = get_token()
-    except Exception as e:
-        return _error_result(str(e), "client->server")
-    try:
-        steps = ["read"]
-        ok, bundle_results, error_stage, error = _run_bundle(profile, dev_eui, token, steps)
-        if not ok:
-            return _error_result(error or "Bundle failed", error_stage or "client->server")
-        return _result(True, data=bundle_results["read"])
-    except Exception as e:
-        return _error_result(str(e), "client->server")
+    token = get_token()
+    bundle_results = _run_bundle(profile, dev_eui, token, ["read"])
+    return _result(True, data=bundle_results["read"])
 
 
 def read_mmwave(dev_eui: str) -> Dict[str, Any]:
     # Radar data is uplink-only here, so just pull and decode the latest packet.
     profile = MMWaveSensor()
-    try:
-        token = get_token()
-    except Exception as e:
-        return _error_result(str(e), "client->server")
-    try:
-        status, uplinks = pull_latest_uplinks(
-            device_id=dev_eui,
-            auth_token=token,
-            size=10,
-        )
-        if status != 1 or not uplinks:
-            return _error_result("Failed to pull latest uplink", "dtu->sensor")
-        hex_data = uplinks[0]["hex"]
-        targets = profile.decode_targets(hex_data)
-        if not targets:
-            return _error_result("No targets detected or failed to decode", "dtu->sensor")
-        return _result(True, data={"targets": targets})
-    except Exception as e:
-        return _error_result(str(e), "client->server")
+    token = get_token()
+    uplinks = pull_latest_uplinks(
+        device_id=dev_eui,
+        auth_token=token,
+        size=10,
+    )
+    if not uplinks:
+        raise KnownStageError("dtu->sensor", "Failed to pull latest uplink")
+    hex_data = uplinks[0]["hex"]
+    targets = profile.decode_targets(hex_data)
+    if not targets:
+        raise KnownStageError("dtu->sensor", "No targets detected or failed to decode")
+    return _result(True, data={"targets": targets})
 
 
 # Start the background router as soon as this module is imported.
