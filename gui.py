@@ -4,6 +4,7 @@ Multi-sensor dashboard that only enqueues requests and renders buffered results.
 
 import argparse
 import math
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -40,6 +41,12 @@ class SensorDashboard:
             "ta": False,
             "wl": False,
             "mmwave": False,
+        }
+        self.read_started_at = {
+            "ht": 0.0,
+            "ta": 0.0,
+            "wl": 0.0,
+            "mmwave": 0.0,
         }
 
         main_container = ttk.Frame(root)
@@ -104,6 +111,9 @@ class SensorDashboard:
         )
         self.ht_auto_button.pack(side=tk.LEFT)
 
+        self.ht_status = ttk.Label(frame, text="", foreground="black")
+        self.ht_status.grid(row=7, column=0, columnspan=3, sticky=tk.W, padx=5)
+
     def create_tilt_acc_section(self, parent):
         # Tilt and acceleration card for IMU readings.
         frame = ttk.LabelFrame(parent, text="Tilt & Acceleration", padding="10")
@@ -162,6 +172,9 @@ class SensorDashboard:
         )
         self.ta_auto_button.pack(side=tk.LEFT)
 
+        self.ta_status = ttk.Label(frame, text="", foreground="black")
+        self.ta_status.grid(row=10, column=0, columnspan=3, sticky=tk.W, padx=5)
+
     def create_water_level_section(self, parent):
         # Water level card with decoded level and raw frame display.
         frame = ttk.LabelFrame(parent, text="Water Level", padding="10")
@@ -199,6 +212,9 @@ class SensorDashboard:
             command=lambda: self.toggle_auto("wl", self.wl_eui_entry, self.wl_auto_button),
         )
         self.wl_auto_button.pack(side=tk.LEFT)
+
+        self.wl_status = ttk.Label(frame, text="", foreground="black")
+        self.wl_status.grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=5)
 
     def create_radar_section(self, parent):
         # Radar card combines polar plot and a compact target list.
@@ -245,6 +261,9 @@ class SensorDashboard:
         )
         self.mmwave_auto_button.pack(side=tk.LEFT)
 
+        self.mmwave_status = ttk.Label(frame, text="", foreground="black")
+        self.mmwave_status.pack(anchor=tk.W, padx=5)
+
     def setup_radar_plot(self):
         # Reset plot styling before drawing the latest targets.
         self.ax.clear()
@@ -268,6 +287,8 @@ class SensorDashboard:
         # Push a read request into the communicator without blocking the UI.
         dev_eui = eui_entry.get().strip()
         if dev_eui:
+            self.read_started_at[sensor] = time.time()
+            self._set_status(sensor, f"{sensor} Reading...")
             communicator.enqueue_request(dev_eui, sensor)
 
     def toggle_auto(self, sensor, eui_entry, button):
@@ -298,11 +319,33 @@ class SensorDashboard:
         if not dev_eui:
             return
         result = communicator.get_buffer_data(dev_eui, sensor)
-        if not result or not result.get("ok"):
+        if not result:
+            return
+        if result.get("timestamp", 0) < self.read_started_at.get(sensor, 0):
+            return
+        if not result.get("ok"):
+            self._set_status(sensor, f"{sensor} failed")
             if sensor == "mmwave":
                 update_func({})
             return
+        self._set_status(sensor, f"{sensor} succeeded")
         update_func(result.get("data") or {})
+
+    def _set_status(self, sensor, text):
+        color = "black"
+        if "failed" in text:
+            color = "red"
+        elif "succeeded" in text:
+            color = "green"
+
+        if sensor == "ht":
+            self.ht_status.config(text=text, foreground=color)
+        elif sensor == "ta":
+            self.ta_status.config(text=text, foreground=color)
+        elif sensor == "wl":
+            self.wl_status.config(text=text, foreground=color)
+        elif sensor == "mmwave":
+            self.mmwave_status.config(text=text, foreground=color)
 
 
 
