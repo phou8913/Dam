@@ -111,7 +111,7 @@ class SensorDashboard:
         )
         self.ht_auto_button.pack(side=tk.LEFT)
 
-        self.ht_status = ttk.Label(frame, text="", foreground="black")
+        self.ht_status = ttk.Label(frame, text="", foreground="black", wraplength=500, justify=tk.LEFT)
         self.ht_status.grid(row=7, column=0, columnspan=3, sticky=tk.W, padx=5)
 
     def create_tilt_acc_section(self, parent):
@@ -172,7 +172,7 @@ class SensorDashboard:
         )
         self.ta_auto_button.pack(side=tk.LEFT)
 
-        self.ta_status = ttk.Label(frame, text="", foreground="black")
+        self.ta_status = ttk.Label(frame, text="", foreground="black", wraplength=500, justify=tk.LEFT)
         self.ta_status.grid(row=10, column=0, columnspan=3, sticky=tk.W, padx=5)
 
     def create_water_level_section(self, parent):
@@ -213,7 +213,7 @@ class SensorDashboard:
         )
         self.wl_auto_button.pack(side=tk.LEFT)
 
-        self.wl_status = ttk.Label(frame, text="", foreground="black")
+        self.wl_status = ttk.Label(frame, text="", foreground="black", wraplength=500, justify=tk.LEFT)
         self.wl_status.grid(row=5, column=0, columnspan=3, sticky=tk.W, padx=5)
 
     def create_radar_section(self, parent):
@@ -261,7 +261,7 @@ class SensorDashboard:
         )
         self.mmwave_auto_button.pack(side=tk.LEFT)
 
-        self.mmwave_status = ttk.Label(frame, text="", foreground="black")
+        self.mmwave_status = ttk.Label(frame, text="", foreground="black", wraplength=350, justify=tk.LEFT)
         self.mmwave_status.pack(anchor=tk.W, padx=5)
 
     def setup_radar_plot(self):
@@ -324,12 +324,17 @@ class SensorDashboard:
         if result.get("timestamp", 0) < self.read_started_at.get(sensor, 0):
             return
         if not result.get("ok"):
-            self._set_status(sensor, f"{sensor} failed")
+            self._set_status(sensor, self._format_error_status(sensor, result))
             if sensor == "mmwave":
                 update_func({})
             return
         self._set_status(sensor, f"{sensor} succeeded")
         update_func(result.get("data") or {})
+
+    def _format_error_status(self, sensor, result):
+        error_stage = result.get("error_stage") or "unknown"
+        error_reason = result.get("error") or "Unknown error"
+        return f"{sensor} failed [{error_stage}]: {error_reason}"
 
     def _set_status(self, sensor, text):
         color = "black"

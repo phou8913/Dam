@@ -9,6 +9,15 @@ Usage:
 Then configure communicator.py to use BASE_URL = "http://127.0.0.1:5000/api"
 """
 
+"""
+powershell -Command
+$env:FAKE_AUTH_OK="1"
+$env:FAKE_QUEUE_OK="1"
+$env:FAKE_UPLINK_ENABLED="1"
+$env:FAKE_GATEWAY_ONLINE="1"
+$env:FAKE_SENSOR_MATCH="ta"
+"""
+
 from flask import Flask, request, jsonify
 import time
 import random
